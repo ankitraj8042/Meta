@@ -1,0 +1,36 @@
+# ER-MAP: Emergency Response Multi-Agent Pipeline
+# OpenEnv Deployment Specification
+
+env:
+  name: "er-map-triage"
+  version: "1.0.0"
+  description: >
+    Multi-agent medical triage simulation environment where a Doctor RL agent
+    orchestrates Nurse and Patient LLM actors to diagnose and treat emergency
+    patients. Features domain-randomized patient/nurse personas, dense reward
+    shaping, consent-based treatment mechanics, and 5 disease configurations.
+
+  entry_point: "ER_MAP.envs.triage_env:TriageEnv"
+
+  action_space: "Text"
+  observation_space: "Text"
+
+  max_episode_steps: 15
+
+  env_kwargs:
+    groq_api_key: "${GROQ_API_KEY}"
+    model: "llama-3.1-8b-instant"
+    render_mode: "human"
+
+  dependencies:
+    python: ">=3.9"
+    packages:
+      - "gymnasium>=0.29.0"
+      - "groq>=0.4.0"
+      - "openenv-core>=0.1.0"
+
+  metadata:
+    authors: ["ER-MAP Team"]
+    license: "MIT"
+    tags: ["medical", "multi-agent", "triage", "rl", "llm"]
+    hackathon: "Meta PyTorch OpenEnv Hackathon 2026"

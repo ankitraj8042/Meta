@@ -1,0 +1,32 @@
+# ER-MAP: Emergency Response Multi-Agent Pipeline
+# Requirements
+
+# --- Core ---
+gymnasium>=0.29.0
+openenv-core>=0.1.0
+
+# --- LLM Inference (Environment Actors) ---
+groq>=0.4.0
+
+# --- Training (Doctor RL Agent) ---
+torch>=2.0.0
+transformers>=4.38.0
+trl>=0.8.0
+peft>=0.9.0
+accelerate>=0.27.0
+datasets>=2.16.0
+unsloth>=2024.1
+
+# --- Optional: Logging ---
+wandb>=0.16.0
+
+# --- TTS (Voice System) ---
+elevenlabs>=1.0.0
+edge-tts>=6.1.0
+pygame>=2.5.0
+
+# --- Dashboard ---
+flask>=3.0.0
+
+# --- Utilities ---
+pydantic>=2.0.0

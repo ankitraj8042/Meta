@@ -1,0 +1,102 @@
+[
+  {
+    "episode": 1,
+    "disease": "Sepsis from Urinary Source",
+    "difficulty": "random",
+    "compliance": "non_compliant",
+    "communication": "calm_stoic",
+    "outcome": "WRONG",
+    "total_reward": -1.56,
+    "steps": 11
+  },
+  {
+    "episode": 2,
+    "disease": "Bacterial Meningitis",
+    "difficulty": "random",
+    "compliance": "non_compliant",
+    "communication": "anxious_panicked",
+    "outcome": "WIN",
+    "total_reward": 2.3,
+    "steps": 10
+  },
+  {
+    "episode": 3,
+    "disease": "Hypoglycemia",
+    "difficulty": "random",
+    "compliance": "partially_compliant",
+    "communication": "calm_stoic",
+    "outcome": "WRONG",
+    "total_reward": -1.58,
+    "steps": 8
+  },
+  {
+    "episode": 4,
+    "disease": "Bacterial Meningitis",
+    "difficulty": "random",
+    "compliance": "partially_compliant",
+    "communication": "hostile_aggressive",
+    "outcome": "WIN",
+    "total_reward": 2.42,
+    "steps": 8
+  },
+  {
+    "episode": 5,
+    "disease": "Sepsis from Urinary Source",
+    "difficulty": "random",
+    "compliance": "fully_compliant",
+    "communication": "anxious_panicked",
+    "outcome": "WRONG",
+    "total_reward": -1.6,
+    "steps": 10
+  },
+  {
+    "episode": 6,
+    "disease": "Acute Asthma Exacerbation",
+    "difficulty": "random",
+    "compliance": "fully_compliant",
+    "communication": "disorganized_confused",
+    "outcome": "WIN",
+    "total_reward": 2.42,
+    "steps": 8
+  },
+  {
+    "episode": 7,
+    "disease": "Acute Ischemic Stroke",
+    "difficulty": "random",
+    "compliance": "cost_constrained",
+    "communication": "calm_stoic",
+    "outcome": "WRONG",
+    "total_reward": -1.64,
+    "steps": 9
+  },
+  {
+    "episode": 8,
+    "disease": "Hypoglycemia",
+    "difficulty": "random",
+    "compliance": "non_compliant",
+    "communication": "anxious_panicked",
+    "outcome": "WRONG",
+    "total_reward": -1.7,
+    "steps": 5
+  },
+  {
+    "episode": 9,
+    "disease": "Acute Ischemic Stroke",
+    "difficulty": "random",
+    "compliance": "cost_constrained",
+    "communication": "disorganized_confused",
+    "outcome": "WRONG",
+    "total_reward": -1.62,
+    "steps": 7
+  },
+  {
+    "episode": 10,
+    "disease": "Hypoglycemia",
+    "difficulty": "random",
+    "compliance": "partially_compliant",
+    "communication": "disorganized_confused",
+    "outcome": "WRONG",
+    "total_reward": -1.68,
+    "steps": 8
+  }
+]
