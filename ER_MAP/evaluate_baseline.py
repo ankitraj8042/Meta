@@ -64,8 +64,8 @@ _DEMO_KEYS = {
     "GROQ_EMPATHY_JUDGE_API_KEY": "",
     "GROQ_MEDICAL_JUDGE_API_KEY": "",
     "ERMAP_DOCTOR_MODEL":         "llama-3.1-8b-instant",
-    "ERMAP_NURSE_MODEL":          "llama-3.3-70b-versatile",
-    "ERMAP_PATIENT_MODEL":        "llama-3.3-70b-versatile",
+    "ERMAP_NURSE_MODEL":          "llama-3.1-8b-instant",
+    "ERMAP_PATIENT_MODEL":        "llama-3.1-8b-instant",
 }
 
 

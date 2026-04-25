@@ -46,14 +46,15 @@ _DEMO_KEYS = {
     "GROQ_EMPATHY_JUDGE_API_KEY":   "",
     "GROQ_MEDICAL_JUDGE_API_KEY":   "",
 
-    # --- Per-role models ---
-    # Doctor runs the small/fast tier (Llama-3.1-8B-Instant) — Groq does
-    # not host a Llama-7B; 8B is the closest Llama small-tier on Groq and
-    # gives ~14 400 req/day per key vs ~6 000/day for 70B.
+    # --- Per-role models (traffic-shaping for free-tier budget) ---
+    # High-volume agents (Doctor / Nurse / Patient — fire on every env
+    # step) run the 8B-instant pool: 14 400 RPD / 500K TPD per account.
+    # The two judges fire mostly on terminal events but their grading
+    # quality directly shapes the reward, so they stay on 70B-versatile
+    # (1 000 RPD / 100K TPD pool — separate budget).
     "ERMAP_DOCTOR_MODEL":           "llama-3.1-8b-instant",
-    # Everyone else runs Llama-3.3-70B for nuanced personas / grading.
-    "ERMAP_NURSE_MODEL":            "llama-3.3-70b-versatile",
-    "ERMAP_PATIENT_MODEL":          "llama-3.3-70b-versatile",
+    "ERMAP_NURSE_MODEL":            "llama-3.1-8b-instant",
+    "ERMAP_PATIENT_MODEL":          "llama-3.1-8b-instant",
     "ERMAP_EMPATHY_JUDGE_MODEL":    "llama-3.3-70b-versatile",
     "ERMAP_MEDICAL_JUDGE_MODEL":    "llama-3.3-70b-versatile",
 

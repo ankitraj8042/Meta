@@ -106,13 +106,27 @@ In practice: a single 12-hour session is usually enough to clear Phase 1 and pro
 
 ## Per-role Groq keys vs. one shared key
 
-The dashboard ships with 4 distinct Groq clients (Nurse, Patient, Empathy Judge, Medical Judge) and a fallback chain that walks across all four if any fails auth. Inside training:
+The dashboard ships with 4 distinct Groq clients (Nurse, Patient, Empathy Judge, Medical Judge) and a fallback chain that walks across all four if any fails auth. Per-key budgets are *shared* on Groq's free tier (limits are per-account, not per-key) — but the model split below buys you real headroom because **each model has its own daily pool**.
 
-- Each env step does **1 Nurse + 1 Patient + occasionally 1 Empathy Judge + 1 Medical Judge call** (judges fire mostly on terminal actions, so call ratio is roughly 4 : 4 : 1 : 1).
-- 1 free Groq key = 14 400 req/day on 8B-instant or 6 000 req/day on 70B-versatile.
-- 120-episode training × 8 avg steps × 2 conversational LLM calls = ~2 000 calls. **Even one key is enough for a single training run**, but if you split across 4 keys you have 4× the daily headroom for re-runs.
+### Default model assignment (traffic-shaping)
 
-If you only have **one** Groq key, set just `GROQ_API_KEY` as a Kaggle Secret. Everything still works — the AgentRouter falls back to the same client for all roles.
+| Role | Model | Free-tier pool | Why |
+|---|---|---|---|
+| Nurse | `llama-3.1-8b-instant` | 14 400 RPD / 500K TPD | high-volume (every env step) |
+| Patient | `llama-3.1-8b-instant` | shared 8B pool | high-volume (every env step) |
+| Empathy Judge | `llama-3.3-70b-versatile` | 1 000 RPD / 100K TPD | grading quality directly shapes reward |
+| Medical Judge | `llama-3.3-70b-versatile` | shared 70B pool | grading quality directly shapes reward |
+
+Quick budget check for **one full 120-episode training run**:
+
+| Pool | Estimated calls/run | Daily ceiling | Headroom |
+|---|---|---|---|
+| 8B-instant (Nurse + Patient) | ~2 880 | 14 400 RPD | ~5x |
+| 70B-versatile (judges) | ~720 | 1 000 RPD | ~1.4x |
+
+You can do **one training run per day per account** comfortably. If you need to retry inside the same day, drop one of the two judges to 8B-instant temporarily — the reward signal degrades a little, but training keeps moving.
+
+If you only have **one** Groq key total, set just `GROQ_API_KEY` as a Kaggle Secret. Everything still works — the AgentRouter falls back to the same client for all roles, and the per-model budgets still split traffic across pools.
 
 ---
 
