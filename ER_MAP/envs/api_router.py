@@ -125,12 +125,18 @@ class AgentRouter:
 
         # Per-role models: each role can run a different Groq model so the
         # Doctor (e.g. 8B for speed/quota) is independent of the Judges
-        # (70B for nuanced grading).
+        # (70B for nuanced grading). Resolution order, per role:
+        #   1. Explicit constructor kwarg (e.g. nurse_model=...)
+        #   2. ERMAP_<ROLE>_MODEL env var (set by the Kaggle notebook /
+        #      dashboard / .env to traffic-shape across Groq's 8B vs 70B
+        #      pools — high-volume Patient/Nurse on 8B-instant, both
+        #      Judges on 70B-versatile)
+        #   3. Shared `model` default (legacy single-model behaviour)
         self._models: Dict[str, str] = {
-            "nurse":          nurse_model          or model,
-            "patient":        patient_model        or model,
-            "empathy_judge":  empathy_judge_model  or model,
-            "medical_judge":  medical_judge_model  or model,
+            "nurse":          nurse_model          or os.environ.get("ERMAP_NURSE_MODEL", "")          or model,
+            "patient":        patient_model        or os.environ.get("ERMAP_PATIENT_MODEL", "")        or model,
+            "empathy_judge":  empathy_judge_model  or os.environ.get("ERMAP_EMPATHY_JUDGE_MODEL", "")  or model,
+            "medical_judge":  medical_judge_model  or os.environ.get("ERMAP_MEDICAL_JUDGE_MODEL", "")  or model,
         }
 
         # Resolve per-role API keys (explicit > role-specific env > shared)
