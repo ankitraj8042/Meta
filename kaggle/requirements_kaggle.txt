@@ -14,7 +14,12 @@
 # =====================================================================
 
 # --- Environment / RL plumbing ---
-torch>=2.11.0
+# IMPORTANT: do NOT pin torch here.
+# Kaggle's GPU image already ships with torch 2.10.0+cu128 (CUDA 12.8) which
+# is what bitsandbytes / unsloth / xformers are linked against. Pinning
+# `torch>=2.11.0` causes pip to upgrade torch to a generic CUDA-13 build,
+# which breaks `bitsandbytes` (libnvJitLink.so.13 missing) and prevents the
+# 4-bit Doctor LoRA from loading on T4 GPUs.
 gymnasium>=0.29.0
 openenv-core>=0.1.0
 
@@ -44,4 +49,7 @@ huggingface_hub>=0.25.0
 #     need. ---
 unsloth>=2025.3.0
 unsloth_zoo>=2025.3.0
-trl>=0.11.0,<0.15.0
+# NOTE: do NOT pin trl below 0.18 — recent unsloth releases (2026.x) require
+# trl >= 0.18.2 for the new GRPO interface. Pinning trl<0.15.0 forces pip to
+# silently downgrade `unsloth` to 2025.10.x, losing the latest fast-path.
+trl>=0.18.2
