@@ -686,9 +686,47 @@ def train(
     phase_min_win_rate: float = 0.20,
     convergence_window: int = 3,
     early_stop: bool = True,
+    # ---------------- Fixed-budget curriculum (alternative mode) -----------
+    # When set, training advances phases at FIXED episode counts instead of
+    # via the reward-target early-stop. Useful when you want a clean
+    # reward-growth curve over a known wall-clock budget. Example:
+    #   phase_episode_budgets = {1: 20, 2: 30, 3: 50}  # 100 episodes total
+    # When this is provided, `early_stop` is forced to False (the reward
+    # thresholds become observational, logged for plots only) and
+    # `num_episodes` is auto-set to sum(phase_episode_budgets.values()) if
+    # the caller passed a smaller / inconsistent value.
+    phase_episode_budgets: Optional[Dict[int, int]] = None,
 ):
     if phase_reward_targets is None:
         phase_reward_targets = {1: 1.5, 2: 1.2, 3: 1.0}
+
+    # Fixed-budget mode overrides early-stop and aligns num_episodes.
+    fixed_budget_mode = phase_episode_budgets is not None and len(phase_episode_budgets) > 0
+    if fixed_budget_mode:
+        # Sanity: must have all 3 phases keyed, all positive ints
+        missing = [p for p in (1, 2, 3) if p not in phase_episode_budgets]
+        if missing:
+            raise ValueError(
+                f"phase_episode_budgets must include all phases (1,2,3); missing: {missing}"
+            )
+        for _p, _n in phase_episode_budgets.items():
+            if not isinstance(_n, int) or _n <= 0:
+                raise ValueError(
+                    f"phase_episode_budgets[{_p}] must be a positive int, got {_n!r}"
+                )
+        budget_sum = sum(phase_episode_budgets.values())
+        if num_episodes != budget_sum:
+            logger.info(
+                f"[Fixed-budget] num_episodes ({num_episodes}) overridden to "
+                f"sum(phase_episode_budgets) = {budget_sum}"
+            )
+            num_episodes = budget_sum
+        if early_stop:
+            logger.info(
+                "[Fixed-budget] early_stop=True is incompatible with fixed budgets; "
+                "disabling early_stop. Reward targets will still be logged for plots."
+            )
+            early_stop = False
     """
     Main GRPO training loop with curriculum scheduling.
 
@@ -758,7 +796,17 @@ def train(
 
     logger.info(f"\nStarting GRPO training for up to {num_episodes} episodes "
                 f"(={num_episodes // group_size} GRPO updates)")
-    if early_stop:
+    if fixed_budget_mode:
+        logger.info(
+            "  Fixed-budget curriculum: phases advance at fixed episode counts."
+        )
+        for _pid in sorted(phase_episode_budgets.keys()):
+            logger.info(
+                f"    Phase {_pid}: {phase_episode_budgets[_pid]} episodes "
+                f"(target avg-reward {phase_reward_targets.get(_pid, float('nan')):+.2f}, "
+                f"observational only)"
+            )
+    elif early_stop:
         logger.info(
             f"  Early-stop ON: per-phase reward thresholds (sustained for "
             f"{convergence_window} groups, win-rate >= {phase_min_win_rate:.0%}):"
@@ -955,6 +1003,32 @@ def train(
             f"Phase Episodes: {s['phase_episodes']}"
         )
 
+        # --- Fixed-budget phase transition ---------------------------------
+        # When the operator pre-allocates per-phase episode budgets (e.g.
+        # P1=20, P2=30, P3=50), advance at the boundaries regardless of
+        # reward. Phase 3 budget exhaustion lets the outer-loop
+        # `num_episodes` cap end training naturally.
+        if fixed_budget_mode:
+            current_phase = s["phase"]
+            budget = phase_episode_budgets.get(current_phase, 0)
+            if (
+                current_phase < 3
+                and s["phase_episodes"] >= budget
+            ):
+                promoted = scheduler.force_promote(
+                    reason=(
+                        f"fixed-budget: completed {s['phase_episodes']} episodes "
+                        f"in Phase {current_phase} (budget={budget})"
+                    )
+                )
+                if promoted:
+                    new_phase = scheduler.phase_id
+                    logger.info(
+                        f"  [Fixed-budget] Phase {current_phase} budget exhausted "
+                        f"-> Phase {new_phase}: {scheduler.current_phase.name} "
+                        f"({phase_episode_budgets.get(new_phase, '?')} episodes allocated)"
+                    )
+
         # --- Per-phase early-stop / promotion check ------------------------
         # Maintain a buffer of the last `convergence_window` GRPO groups
         # with their (phase, rolling_avg, rolling_win). When ALL N entries
@@ -1099,7 +1173,25 @@ if __name__ == "__main__":
     parser.add_argument("--no-early-stop", action="store_true",
                         help="Disable early-stop (always run all configured episodes)")
 
+    # Fixed-budget curriculum (mutually exclusive with early-stop)
+    parser.add_argument("--phase1-budget", type=int, default=None,
+                        help="Fixed episode budget for Phase 1 (Tool Mastery)")
+    parser.add_argument("--phase2-budget", type=int, default=None,
+                        help="Fixed episode budget for Phase 2 (Clinical Reasoning)")
+    parser.add_argument("--phase3-budget", type=int, default=None,
+                        help="Fixed episode budget for Phase 3 (Empathetic Negotiation)")
+
     args = parser.parse_args()
+
+    _budgets = None
+    if any(b is not None for b in (args.phase1_budget, args.phase2_budget, args.phase3_budget)):
+        if not all(b is not None for b in (args.phase1_budget, args.phase2_budget, args.phase3_budget)):
+            parser.error("--phase{1,2,3}-budget must all be set together")
+        _budgets = {
+            1: args.phase1_budget,
+            2: args.phase2_budget,
+            3: args.phase3_budget,
+        }
 
     train(
         num_episodes=args.episodes,
@@ -1119,4 +1211,5 @@ if __name__ == "__main__":
         phase_min_win_rate=args.phase_min_win_rate,
         convergence_window=args.convergence_window,
         early_stop=not args.no_early_stop,
+        phase_episode_budgets=_budgets,
     )
