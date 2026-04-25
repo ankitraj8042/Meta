@@ -14,6 +14,7 @@
 # =====================================================================
 
 # --- Environment / RL plumbing ---
+torch>=2.11.0
 gymnasium>=0.29.0
 openenv-core>=0.1.0
 
@@ -30,6 +31,17 @@ huggingface_hub>=0.25.0
 # --- Training stack: install Unsloth LAST. Unsloth's setup pins exact
 #     versions of bitsandbytes / xformers / triton matched to the
 #     Kaggle CUDA image, and re-installing those after Unsloth tends
-#     to break the build. ---
-unsloth==2024.12.4
+#     to break the build.
+#
+#     IMPORTANT: do NOT pin `unsloth` to an old version. `unsloth` and
+#     `unsloth_zoo` are released as a matched pair — if pip pulls a
+#     fresh `unsloth_zoo` against an old `unsloth`, you get:
+#         ImportError: cannot import name 'create_gradient_checkpointing_buffer'
+#     We list both packages explicitly so pip resolves the latest
+#     compatible pair from one wheel index in one resolve pass. The
+#     install cell in the notebook adds `--upgrade` to force-update
+#     both whenever Kaggle's pre-baked layer is older than what we
+#     need. ---
+unsloth>=2025.3.0
+unsloth_zoo>=2025.3.0
 trl>=0.11.0,<0.15.0
