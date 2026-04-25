@@ -64,7 +64,7 @@ class TriageEnv(gym.Env):
         groq_api_key: Optional[str] = None,
         nurse_api_key: Optional[str] = None,
         patient_api_key: Optional[str] = None,
-        model: str = "llama-3.1-8b-instant",
+        model: str = "llama-3.3-70b-versatile",
         render_mode: Optional[str] = None,
     ):
         super().__init__()
@@ -146,7 +146,8 @@ class TriageEnv(gym.Env):
 
         # 5. Initialize phase-based systems
         self.patient_state = PatientState(self.ground_truth["patient"])
-        self.milestone_tracker = MilestoneTracker(phase=self.phase)
+        is_emergency = self.ground_truth.get("disease", {}).get("is_emergency", False)
+        self.milestone_tracker = MilestoneTracker(phase=self.phase, is_emergency=is_emergency)
 
         # 5. Build initial observation for Doctor
         #    Doctor sees nurse experience level + the pre-populated SOAP note.
@@ -158,6 +159,7 @@ class TriageEnv(gym.Env):
                 "A nurse is available to assist. A patient has just arrived. "
                 "Use your tools to diagnose and treat the patient.\n"
                 "TOOLS: speak_to, order_lab, read_soap, update_soap, terminal_discharge.\n"
+                "When using 'terminal_discharge', you MUST include an 'is_emergency' boolean field (true/false) to indicate if this is a time-critical emergency.\n"
                 "The patient's prior medical history and initial presentation "
                 "have been recorded in the SOAP note. Use 'read_soap' to review it. "
                 "Update the Assessment and Plan sections before discharging."
@@ -183,7 +185,11 @@ class TriageEnv(gym.Env):
         info: Dict[str, Any] = {}
 
         # --- Turn penalty ---
-        reward += -0.01
+        is_emergency = self.ground_truth.get("disease", {}).get("is_emergency", False)
+        if is_emergency:
+            reward += -0.15  # Heavy penalty for wasting time in emergencies
+        else:
+            reward += -0.01
 
         # --- Parse Doctor's JSON action ---
         doctor_action = self._parse_doctor_action(action)
@@ -504,7 +510,23 @@ class TriageEnv(gym.Env):
         """Handle Doctor using 'terminal_discharge' tool. This ends the episode."""
         reward = 0.0
         treatment = doctor_action.get("treatment", "").strip().lower()
+        declared_emergency = bool(doctor_action.get("is_emergency", False))
+        is_actual_emergency = self.ground_truth.get("disease", {}).get("is_emergency", False)
         self.done = True
+
+        # --- Emergency Identification Reward ---
+        if declared_emergency and is_actual_emergency:
+            reward += 0.50
+            logger.info("Emergency correctly identified (+0.50).")
+        elif not declared_emergency and not is_actual_emergency:
+            reward += 0.10
+            logger.info("Non-emergency correctly identified (+0.10).")
+        elif declared_emergency and not is_actual_emergency:
+            reward += -0.30
+            logger.info("False positive emergency identification (-0.30).")
+        elif not declared_emergency and is_actual_emergency:
+            reward += -0.50
+            logger.info("Failed to identify true emergency (-0.50).")
 
         # --- SOAP reward shaping: penalize empty Assessment, reward filled ---
         assessment = self.emr.get("Assessment", "").strip()
@@ -516,22 +538,24 @@ class TriageEnv(gym.Env):
             logger.info("SOAP penalty: No Assessment documented before discharge.")
 
         # --- SOAP reward shaping: penalize ignoring patient history ---
-        if self.milestone_tracker and not self.milestone_tracker.achieved.get("READ_SOAP", False):
+        is_emergency = self.ground_truth.get("disease", {}).get("is_emergency", False)
+        if self.milestone_tracker and not self.milestone_tracker.achieved.get("READ_SOAP", False) and not is_emergency:
             reward += -0.50  # Heavy penalty for practicing medicine blind
             logger.info("SOAP penalty: Discharged without reading patient history (read_soap).")
 
         # --- Early discharge penalty: phase-aware ---
         # Phase 1: min 4 steps, Phase 2: min 6 steps, Phase 3: min 8 steps
-        min_steps_map = {1: 4, 2: 6, 3: 8}
-        min_steps = min_steps_map.get(self.phase, 5)
-        if self.step_count < min_steps:
-            shortfall = min_steps - self.step_count
-            penalty = -0.15 * shortfall  # -0.15 per missing step
-            reward += penalty
-            logger.info(
-                f"Early discharge penalty: step {self.step_count} < min {min_steps} "
-                f"(phase {self.phase}), penalty={penalty:.2f}"
-            )
+        if not is_emergency:
+            min_steps_map = {1: 4, 2: 6, 3: 8}
+            min_steps = min_steps_map.get(self.phase, 5)
+            if self.step_count < min_steps:
+                shortfall = min_steps - self.step_count
+                penalty = -0.15 * shortfall  # -0.15 per missing step
+                reward += penalty
+                logger.info(
+                    f"Early discharge penalty: step {self.step_count} < min {min_steps} "
+                    f"(phase {self.phase}), penalty={penalty:.2f}"
+                )
 
         # Auto-record the treatment in SOAP Plan
         self.emr["Plan"] = treatment
@@ -540,77 +564,136 @@ class TriageEnv(gym.Env):
         lethal_treatments = [
             t.lower() for t in self.ground_truth["disease"]["lethal_treatments"]
         ]
+        disease_name = self.ground_truth["disease"]["true_disease"]
 
-        # --- WIN / PARTIAL / INCORRECT scoring ---
-        # Use keyword overlap + substring matching for flexible evaluation
-        correct_keywords = set(re.findall(r"\w+", correct_treatment))
-        treatment_keywords = set(re.findall(r"\w+", treatment))
+        # --- LLM-as-a-Judge Evaluation ---
+        # Use a 70B model to semantically grade the treatment plan
+        judge_result = None
+        if self.router:
+            try:
+                judge_result = self.router.evaluate_treatment(
+                    prescribed_treatment=treatment,
+                    correct_treatment=self.ground_truth["disease"]["correct_treatment"],
+                    lethal_treatments=self.ground_truth["disease"]["lethal_treatments"],
+                    disease_name=disease_name,
+                )
+                logger.info(f"LLM Judge result: {judge_result}")
+            except Exception as e:
+                logger.error(f"LLM Judge failed, falling back to keyword matching: {e}")
 
-        # Direct keyword overlap
-        overlap = correct_keywords & treatment_keywords
+        if judge_result and judge_result.get("score") is not None:
+            # --- LLM Judge path ---
+            score = judge_result["score"]
+            is_lethal = judge_result.get("is_lethal", False)
+            reasoning = judge_result.get("reasoning", "")
 
-        # Fuzzy substring matching: "hemodialysis" matches "dialysis",
-        # "gluconate" matches "gluconate", etc.
-        for c_kw in correct_keywords - overlap:
-            for t_kw in treatment_keywords:
-                if len(c_kw) >= 4 and (c_kw in t_kw or t_kw in c_kw):
-                    overlap.add(c_kw)
-                    break
-
-        overlap_ratio = len(overlap) / max(len(correct_keywords), 1)
-
-        # Check for lethal treatment FIRST (always overrides)
-        is_lethal = any(
-            lethal_kw in treatment
-            for lethal_kw in lethal_treatments
-        )
-
-        if is_lethal:
-            reward += -1.50  # FATAL LOSS — worst outcome, patient death
-            obs = json.dumps({
-                "event": "terminal_fatal",
-                "message": "CRITICAL ERROR: Lethal treatment administered. Patient death.",
-                "ground_truth": self.ground_truth["disease"]["true_disease"],
-                "prescribed_treatment": treatment,
-                "soap_note": self.emr,
-            })
-        elif overlap_ratio >= 0.70:
-            # Full WIN — truly comprehensive treatment plan
-            reward += 1.00
-            obs = json.dumps({
-                "event": "terminal_win",
-                "message": "Correct diagnosis and treatment! Patient stabilized.",
-                "ground_truth": self.ground_truth["disease"]["true_disease"],
-                "prescribed_treatment": treatment,
-                "match_ratio": round(overlap_ratio, 2),
-                "soap_note": self.emr,
-            })
-        elif overlap_ratio >= 0.20:
-            # PARTIAL — recognized the condition but treatment incomplete
-            partial_reward = -0.40 + (overlap_ratio * 1.2)  # scales from -0.16 to +0.44
-            reward += partial_reward
-            obs = json.dumps({
-                "event": "terminal_partial",
-                "message": f"Partially correct treatment ({overlap_ratio:.0%} match). Key interventions missing.",
-                "ground_truth": self.ground_truth["disease"]["true_disease"],
-                "correct_treatment": self.ground_truth["disease"]["correct_treatment"],
-                "prescribed_treatment": treatment,
-                "match_ratio": round(overlap_ratio, 2),
-                "matched_keywords": sorted(overlap),
-                "soap_note": self.emr,
-            })
+            if is_lethal:
+                reward += -1.50
+                obs = json.dumps({
+                    "event": "terminal_fatal",
+                    "message": f"CRITICAL ERROR: Lethal treatment administered. {reasoning}",
+                    "ground_truth": disease_name,
+                    "prescribed_treatment": treatment,
+                    "judge_score": score,
+                    "judge_reasoning": reasoning,
+                    "soap_note": self.emr,
+                })
+            elif score >= 0.75:
+                reward += 1.00
+                obs = json.dumps({
+                    "event": "terminal_win",
+                    "message": f"Correct diagnosis and treatment! {reasoning}",
+                    "ground_truth": disease_name,
+                    "prescribed_treatment": treatment,
+                    "judge_score": score,
+                    "judge_reasoning": reasoning,
+                    "soap_note": self.emr,
+                })
+            elif score >= 0.30:
+                partial_reward = -0.40 + (score * 1.4)  # scales from 0.02 to 0.65
+                reward += partial_reward
+                obs = json.dumps({
+                    "event": "terminal_partial",
+                    "message": f"Partially correct treatment (Judge: {score:.0%}). {reasoning}",
+                    "ground_truth": disease_name,
+                    "correct_treatment": self.ground_truth["disease"]["correct_treatment"],
+                    "prescribed_treatment": treatment,
+                    "judge_score": score,
+                    "judge_reasoning": reasoning,
+                    "soap_note": self.emr,
+                })
+            else:
+                reward += -1.00
+                obs = json.dumps({
+                    "event": "terminal_incorrect",
+                    "message": f"Incorrect treatment (Judge: {score:.0%}). {reasoning}",
+                    "ground_truth": disease_name,
+                    "correct_treatment": self.ground_truth["disease"]["correct_treatment"],
+                    "prescribed_treatment": treatment,
+                    "judge_score": score,
+                    "judge_reasoning": reasoning,
+                    "soap_note": self.emr,
+                })
         else:
-            # INCORRECT — completely wrong treatment
-            reward += -1.00
-            obs = json.dumps({
-                "event": "terminal_incorrect",
-                "message": "Incorrect treatment. Patient outcome: adverse.",
-                "ground_truth": self.ground_truth["disease"]["true_disease"],
-                "correct_treatment": self.ground_truth["disease"]["correct_treatment"],
-                "prescribed_treatment": treatment,
-                "match_ratio": round(overlap_ratio, 2),
-                "soap_note": self.emr,
-            })
+            # --- Fallback: Keyword matching (if LLM Judge unavailable) ---
+            stop_words = {"for", "if", "or", "and", "with", "to", "of", "the", "a", "an", "in", "on", "at", "by", "from", "unable", "po", "signs", "is", "are", "then", "above", "below"}
+            correct_keywords = set(re.findall(r"\w+", correct_treatment)) - stop_words
+            treatment_keywords = set(re.findall(r"\w+", treatment)) - stop_words
+
+            overlap = correct_keywords & treatment_keywords
+            for c_kw in correct_keywords - overlap:
+                for t_kw in treatment_keywords:
+                    if len(c_kw) >= 4 and (c_kw in t_kw or t_kw in c_kw):
+                        overlap.add(c_kw)
+                        break
+
+            overlap_ratio = len(overlap) / max(len(correct_keywords), 1)
+
+            is_lethal = any(lethal_kw in treatment for lethal_kw in lethal_treatments)
+
+            if is_lethal:
+                reward += -1.50
+                obs = json.dumps({
+                    "event": "terminal_fatal",
+                    "message": "CRITICAL ERROR: Lethal treatment administered. Patient death.",
+                    "ground_truth": disease_name,
+                    "prescribed_treatment": treatment,
+                    "soap_note": self.emr,
+                })
+            elif overlap_ratio >= 0.70:
+                reward += 1.00
+                obs = json.dumps({
+                    "event": "terminal_win",
+                    "message": "Correct diagnosis and treatment! Patient stabilized.",
+                    "ground_truth": disease_name,
+                    "prescribed_treatment": treatment,
+                    "match_ratio": round(overlap_ratio, 2),
+                    "soap_note": self.emr,
+                })
+            elif overlap_ratio >= 0.20:
+                partial_reward = -0.40 + (overlap_ratio * 1.2)
+                reward += partial_reward
+                obs = json.dumps({
+                    "event": "terminal_partial",
+                    "message": f"Partially correct treatment ({overlap_ratio:.0%} match). Key interventions missing.",
+                    "ground_truth": disease_name,
+                    "correct_treatment": self.ground_truth["disease"]["correct_treatment"],
+                    "prescribed_treatment": treatment,
+                    "match_ratio": round(overlap_ratio, 2),
+                    "matched_keywords": sorted(overlap),
+                    "soap_note": self.emr,
+                })
+            else:
+                reward += -1.00
+                obs = json.dumps({
+                    "event": "terminal_incorrect",
+                    "message": "Incorrect treatment. Patient outcome: adverse.",
+                    "ground_truth": disease_name,
+                    "correct_treatment": self.ground_truth["disease"]["correct_treatment"],
+                    "prescribed_treatment": treatment,
+                    "match_ratio": round(overlap_ratio, 2),
+                    "soap_note": self.emr,
+                })
 
         return obs, reward
 

@@ -28,7 +28,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-DEFAULT_MODEL = "llama-3.1-8b-instant"
+DEFAULT_MODEL = "llama-3.3-70b-versatile"
 MAX_SLIDING_WINDOW_TURNS = 3  # Keep system prompt + last 3 exchanges
 DEFAULT_MAX_TOKENS = 512
 DEFAULT_TEMPERATURE = 0.7
@@ -241,6 +241,80 @@ class AgentRouter:
         self._append_to_memory(agent_role, "assistant", json.dumps(parsed))
 
         return parsed
+
+    # ----- LLM-as-a-Judge Treatment Evaluation -----
+
+    def evaluate_treatment(
+        self,
+        prescribed_treatment: str,
+        correct_treatment: str,
+        lethal_treatments: list,
+        disease_name: str,
+    ) -> dict:
+        """
+        Use a 70B LLM as a Chief Medical Officer to grade the Doctor's
+        prescribed treatment against the ground truth.
+
+        Returns:
+            {"score": float 0.0-1.0, "is_lethal": bool, "reasoning": str}
+        """
+        # Pick any available client (prefer nurse client to spread rate limits)
+        client = self._clients.get("nurse") or self._clients.get("patient")
+        if client is None:
+            logger.warning("No API client available for LLM Judge. Returning default score.")
+            return {"score": 0.5, "is_lethal": False, "reasoning": "No API client available."}
+
+        lethal_str = ", ".join(lethal_treatments) if lethal_treatments else "None"
+
+        judge_prompt = (
+            "You are the Chief Medical Officer reviewing an ER Doctor's treatment plan.\n\n"
+            f"## Disease (Hidden from Doctor during episode)\n{disease_name}\n\n"
+            f"## Gold-Standard Correct Treatment\n{correct_treatment}\n\n"
+            f"## Known Lethal / Contraindicated Treatments\n{lethal_str}\n\n"
+            f"## Doctor's Prescribed Treatment\n{prescribed_treatment}\n\n"
+            "## Your Task\n"
+            "Grade the Doctor's treatment plan on a scale of 0.0 to 1.0:\n"
+            "- 1.0 = Covers all critical interventions, correct drugs, correct dosing approach\n"
+            "- 0.75 = Correct diagnosis and most key interventions, minor omissions\n"
+            "- 0.5 = Right diagnosis but significant treatment gaps\n"
+            "- 0.25 = Partially relevant but missing critical life-saving steps\n"
+            "- 0.0 = Completely wrong or dangerous treatment\n\n"
+            "IMPORTANT GRADING RULES:\n"
+            "- Accept synonyms and equivalent drugs (e.g., 'broad-spectrum antibiotics' partially covers 'cefoxitin')\n"
+            "- Accept equivalent procedures described differently (e.g., 'emergency surgery' = 'emergent surgical exploration')\n"
+            "- Penalize missing CRITICAL steps (e.g., missing 'NPO' before surgery, missing specific drug classes)\n"
+            "- Heavily penalize if a lethal/contraindicated treatment was prescribed\n\n"
+            'Respond ONLY in valid JSON:\n'
+            '{"score": <float 0.0-1.0>, "is_lethal": <bool>, "reasoning": "<brief explanation>"}'
+        )
+
+        try:
+            completion = client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "You are a medical evaluation AI. Output ONLY valid JSON."},
+                    {"role": "user", "content": judge_prompt},
+                ],
+                temperature=0.1,  # Low temp for consistent grading
+                max_tokens=256,
+                response_format={"type": "json_object"},
+            )
+            raw_text = completion.choices[0].message.content or ""
+            parsed = _extract_json_from_text(raw_text)
+
+            if parsed and "score" in parsed:
+                score = max(0.0, min(1.0, float(parsed["score"])))
+                is_lethal = bool(parsed.get("is_lethal", False))
+                reasoning = parsed.get("reasoning", "")
+                logger.info(f"LLM Judge: score={score:.2f}, lethal={is_lethal}, reason={reasoning}")
+                return {"score": score, "is_lethal": is_lethal, "reasoning": reasoning}
+            else:
+                logger.warning(f"LLM Judge returned unparseable response: {raw_text[:200]}")
+                return {"score": 0.5, "is_lethal": False, "reasoning": "Judge response unparseable."}
+
+        except Exception as e:
+            logger.error(f"LLM Judge API error: {e}")
+            return {"score": 0.5, "is_lethal": False, "reasoning": f"API error: {e}"}
 
     # ----- Mock Responses (for testing without API) -----
 

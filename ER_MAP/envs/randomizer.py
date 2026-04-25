@@ -137,7 +137,7 @@ PHASE_PERSONA_CONSTRAINTS = {
 # Phase 3: Heavy noise -- behavioral data injected, unreliable history
 # ---------------------------------------------------------------------------
 
-def _apply_soap_noise(soap: Dict[str, Any], phase: int) -> Dict[str, Any]:
+def _apply_soap_noise(soap: Dict[str, Any], phase: int, is_emergency: bool = False) -> Dict[str, Any]:
     """Apply phase-dependent noise to SOAP history. Returns a copy."""
     soap = copy.deepcopy(soap)
     
@@ -159,8 +159,8 @@ def _apply_soap_noise(soap: Dict[str, Any], phase: int) -> Dict[str, Any]:
             soap["Medications"] = soap.get("Medications", "") + " (patient unsure of doses, no medication list available)"
         if random.random() < 0.35:
             soap["Past_Medical_History"] = soap.get("Past_Medical_History", "") + ". NOTE: limited records, patient provides inconsistent timeline."
-        if random.random() < 0.3:
-            # Vague ROS
+        if random.random() < 0.3 and not is_emergency:
+            # Vague ROS (skip for emergencies where ROS is critical)
             ros = soap.get("ROS", {})
             if isinstance(ros, dict) and ros:
                 key = random.choice(list(ros.keys()))
@@ -169,29 +169,46 @@ def _apply_soap_noise(soap: Dict[str, Any], phase: int) -> Dict[str, Any]:
     
     if phase >= 3:
         # Phase 3: Behavioral and socio-economic noise
-        behavioral_notes = [
-            "Patient appears anxious about cost of treatment, asks repeatedly about billing.",
-            "Patient's family member is hostile, demanding immediate answers.",
-            "Patient is tearful, expressing fear of losing job if hospitalized.",
-            "Patient requests to leave AMA, states cannot afford to miss work.",
-            "Language barrier noted -- communicating through teenage child as interpreter.",
-            "Patient appears intoxicated, history unreliable per triage nurse.",
-            "Patient is homeless, uncertain of medication history.",
-            "Patient brought by police from shelter, no ID or insurance card.",
-        ]
+        if is_emergency:
+            behavioral_notes = [
+                "EMS handoff was chaotic and rushed, some details missing.",
+                "Family members are screaming in the hallway, making it hard to obtain history.",
+                "Patient is too unstable to provide complete history; relying on bystander accounts.",
+                "Police brought patient in, no ID or medical records available.",
+                "Multiple traumas arriving simultaneously, triage is overwhelmed.",
+                "Patient unresponsive, unable to obtain comprehensive review of systems.",
+            ]
+        else:
+            behavioral_notes = [
+                "Patient appears anxious about cost of treatment, asks repeatedly about billing.",
+                "Patient's family member is hostile, demanding immediate answers.",
+                "Patient is tearful, expressing fear of losing job if hospitalized.",
+                "Patient requests to leave AMA, states cannot afford to miss work.",
+                "Language barrier noted -- communicating through teenage child as interpreter.",
+                "Patient appears intoxicated, history unreliable per triage nurse.",
+                "Patient is homeless, uncertain of medication history.",
+                "Patient brought by police from shelter, no ID or insurance card.",
+            ]
         soap["Social_History"] = soap.get("Social_History", "") + ". " + random.choice(behavioral_notes)
         
         # Inject conflicting/misleading physical exam findings
-        if random.random() < 0.3:
+        if random.random() < 0.3 and not is_emergency:
             soap["Physical_Examination"] = soap.get("Physical_Examination", "") + " Patient is uncooperative with portions of exam."
         
         # Degrade HPI reliability
         if random.random() < 0.4:
-            hpi_noise = random.choice([
-                " Historian is patient's neighbor, limited knowledge of medical history.",
-                " Patient gives contradictory timeline, unclear onset.",
-                " History obtained through interpreter, possible miscommunication.",
-            ])
+            if is_emergency:
+                hpi_noise = random.choice([
+                    " Historian is an unknown bystander, limited knowledge of medical history.",
+                    " HPI obtained rapidly during active resuscitation.",
+                    " Pre-hospital intervention details unclear from EMS."
+                ])
+            else:
+                hpi_noise = random.choice([
+                    " Historian is patient's neighbor, limited knowledge of medical history.",
+                    " Patient gives contradictory timeline, unclear onset.",
+                    " History obtained through interpreter, possible miscommunication.",
+                ])
             soap["HPI"] = soap.get("HPI", "") + hpi_noise
     
     return soap
@@ -257,6 +274,7 @@ def generate_ground_truth(
                 "lethal_treatments": disease.get("lethal_treatments", []),
                 "critical_labs": disease.get("critical_labs", []),
                 "difficulty": disease.get("difficulty", "medium"),
+                "is_emergency": disease.get("is_emergency", False),
             },
             "difficulty": difficulty,
             "phase": phase,
@@ -284,6 +302,7 @@ def generate_ground_truth(
                 "lethal_treatments": disease.get("lethal_treatments", []),
                 "critical_labs": disease.get("critical_labs", []),
                 "difficulty": disease.get("difficulty", "medium"),
+                "is_emergency": disease.get("is_emergency", False),
             },
             "difficulty": "random",
             "phase": phase,
@@ -291,7 +310,8 @@ def generate_ground_truth(
 
     # Attach SOAP history with phase-appropriate noise
     raw_soap = _SOAP_HISTORY_DB.get(disease_name, {})
-    ground_truth["soap_history"] = _apply_soap_noise(raw_soap, phase)
+    is_emergency = disease.get("is_emergency", False)
+    ground_truth["soap_history"] = _apply_soap_noise(raw_soap, phase, is_emergency)
     
     # Attach vitals and labs
     ground_truth["vitals"] = _VITALS_DB.get(disease_name, "")

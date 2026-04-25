@@ -296,8 +296,9 @@ class MilestoneTracker:
         "DISCHARGE",
     ]
     
-    def __init__(self, phase: int = 1):
+    def __init__(self, phase: int = 1, is_emergency: bool = False):
         self.phase = phase
+        self.is_emergency = is_emergency
         self.achieved: Dict[str, bool] = {m: False for m in self.MILESTONES}
         self.order: list = []  # Track achievement order
     
@@ -321,6 +322,9 @@ class MilestoneTracker:
         expected_idx = self.MILESTONES.index(milestone)
         actual_idx = len(self.order) - 1
         
+        if self.is_emergency:
+            return 0.05  # Emergencies: reward action immediately, no ordering penalty
+            
         if self.phase == 1:
             # Phase 1: Strict ordering enforcement
             if actual_idx == expected_idx:

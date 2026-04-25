@@ -43,7 +43,7 @@ def get_env():
         from ER_MAP.envs.triage_env import TriageEnv
         nurse_key = os.environ.get("GROQ_NURSE_API_KEY", "")
         patient_key = os.environ.get("GROQ_PATIENT_API_KEY", "")
-        model = os.environ.get("ERMAP_MODEL", "llama-3.1-8b-instant")
+        model = os.environ.get("ERMAP_MODEL", "llama-3.3-70b-versatile")
         ENV = TriageEnv(nurse_api_key=nurse_key, patient_api_key=patient_key, model=model)
     return ENV
 
@@ -53,7 +53,7 @@ def get_doctor():
     if DOCTOR is None:
         from groq import Groq
         api_key = os.environ.get("GROQ_DOCTOR_API_KEY", "") or os.environ.get("GROQ_PATIENT_API_KEY", "")
-        model = os.environ.get("ERMAP_MODEL", "llama-3.1-8b-instant")
+        model = os.environ.get("ERMAP_MODEL", "llama-3.3-70b-versatile")
         DOCTOR = DoctorBrain(api_key=api_key, model=model)
     return DOCTOR
 
