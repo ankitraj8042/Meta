@@ -1,0 +1,69 @@
+# --------------------------------------------------------------------
+# ER-MAP .gitignore
+# --------------------------------------------------------------------
+# Secrets — local API keys MUST stay out of git. GitHub push protection
+# rejects commits containing real Groq/ElevenLabs keys.
+.env
+.env.local
+.env.*.local
+*.env
+
+# Python build/runtime artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+.eggs/
+build/
+dist/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# --------------------------------------------------------------------
+# ER-MAP-specific generated outputs
+# --------------------------------------------------------------------
+# GRPO training checkpoints + metrics (regenerable; can be huge)
+er_map_grpo_checkpoints/
+*/er_map_grpo_checkpoints/
+
+# Smoke / scratch test artifacts
+_smoke_*/
+_smoke_*.log
+_dryrun/
+_es_check/
+
+# Baseline-eval scratch directory if it ever gets repointed (the
+# committed baseline_eval/*.png are explicitly tracked — only ignore
+# new throwaway eval folders matching this pattern).
+_baseline_*/
+
+# Kaggle output dir mirror (if you ever pull /kaggle/working/ locally)
+kaggle/working/
+
+# Hugging Face / WandB / cache
+.huggingface/
+wandb/
+.cache/

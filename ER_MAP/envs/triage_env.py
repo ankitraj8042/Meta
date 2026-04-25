@@ -8,6 +8,7 @@ internal environment actors driven by LLMs via the AgentRouter.
 
 import json
 import logging
+import os
 import random
 import re
 from typing import Any, Dict, Optional, Tuple
@@ -39,10 +40,12 @@ NURSE_TOOLS = {"speak_to", "check_vitals", "administer_treatment"}
 PATIENT_TOOLS = {"speak_to", "leave_hospital"}
 
 # ---------------------------------------------------------------------------
-# Max constants
+# Max constants  (overridable via env vars for demo / training tuning)
+#   ERMAP_MAX_EPISODE_STEPS         — total Doctor turns before truncation
+#   ERMAP_MAX_INTERNAL_EXCHANGES    — Nurse ↔ Patient loop cap per Doctor step
 # ---------------------------------------------------------------------------
-MAX_INTERNAL_EXCHANGES = 3   # per Doctor step, Nurse ↔ Patient loop cap
-MAX_EPISODE_STEPS = 30       # total Doctor turns before truncation
+MAX_EPISODE_STEPS = int(os.environ.get("ERMAP_MAX_EPISODE_STEPS", "20"))
+MAX_INTERNAL_EXCHANGES = int(os.environ.get("ERMAP_MAX_INTERNAL_EXCHANGES", "5"))
 
 # ---------------------------------------------------------------------------
 # Per-episode reward caps (anti-farming; keeps process signal balanced
@@ -111,7 +114,13 @@ class TriageEnv(gym.Env):
         groq_api_key: Optional[str] = None,
         nurse_api_key: Optional[str] = None,
         patient_api_key: Optional[str] = None,
+        empathy_judge_api_key: Optional[str] = None,
+        medical_judge_api_key: Optional[str] = None,
         model: str = "llama-3.3-70b-versatile",
+        nurse_model: Optional[str] = None,
+        patient_model: Optional[str] = None,
+        empathy_judge_model: Optional[str] = None,
+        medical_judge_model: Optional[str] = None,
         render_mode: Optional[str] = None,
     ):
         super().__init__()
@@ -124,12 +133,21 @@ class TriageEnv(gym.Env):
             min_length=1, max_length=2048
         )
 
-        # Internal API router for Nurse / Patient LLMs
+        # Internal API router — supports up to 4 distinct Groq clients
+        # (nurse, patient, empathy_judge, medical_judge), each with its
+        # own key and model. Older callers passing only nurse/patient
+        # continue to work — judges silently fall back to those clients.
         self.router = AgentRouter(
             api_key=groq_api_key,
             nurse_api_key=nurse_api_key,
             patient_api_key=patient_api_key,
+            empathy_judge_api_key=empathy_judge_api_key,
+            medical_judge_api_key=medical_judge_api_key,
             model=model,
+            nurse_model=nurse_model,
+            patient_model=patient_model,
+            empathy_judge_model=empathy_judge_model,
+            medical_judge_model=medical_judge_model,
         )
 
         # Episode state

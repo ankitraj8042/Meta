@@ -217,6 +217,18 @@ python -m ER_MAP.training.train_grpo \
     --wandb
 ```
 
+#### Train on Kaggle Free Tier (recommended — $0)
+
+The repo ships with a complete Kaggle workflow under `kaggle/`:
+
+- `kaggle/train_ermap_grpo_kaggle.ipynb` — the notebook (clone repo → install deps → run GRPO → push checkpoints to HF Hub)
+- `kaggle/kaggle_helpers.py` — secret loader, HF push/pull, env-summary printer
+- `kaggle/requirements_kaggle.txt` — Kaggle-image-aware dependency list (Unsloth pinned last)
+- `kaggle/KAGGLE.md` — full setup guide with hardware feasibility table and gotchas
+
+Tested target: **single Tesla T4 16 GB**, Llama-3.1-8B 4-bit + LoRA(r=16), 120 episodes, ~6-8 h per session.
+See `kaggle/KAGGLE.md` for the full step-by-step.
+
 ### Environment API
 ```python
 from ER_MAP.envs.triage_env import TriageEnv

@@ -28,5 +28,9 @@ pygame>=2.5.0
 # --- Dashboard ---
 flask>=3.0.0
 
+# --- OpenEnv FastAPI server (server.py) ---
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+
 # --- Utilities ---
 pydantic>=2.0.0

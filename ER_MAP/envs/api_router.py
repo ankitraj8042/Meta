@@ -110,38 +110,83 @@ class AgentRouter:
         api_key: Optional[str] = None,
         nurse_api_key: Optional[str] = None,
         patient_api_key: Optional[str] = None,
+        empathy_judge_api_key: Optional[str] = None,
+        medical_judge_api_key: Optional[str] = None,
         model: str = DEFAULT_MODEL,
+        nurse_model: Optional[str] = None,
+        patient_model: Optional[str] = None,
+        empathy_judge_model: Optional[str] = None,
+        medical_judge_model: Optional[str] = None,
     ):
+        # Default / shared model (used as fallback when a role-specific
+        # model is not provided). Kept as ``self.model`` for backward
+        # compatibility with any caller that reads it directly.
         self.model = model
 
-        # Resolve per-role API keys (explicit > role-specific env > shared)
-        shared_key = api_key or os.environ.get("GROQ_API_KEY", "")
-        nurse_key = nurse_api_key or os.environ.get("GROQ_NURSE_API_KEY", "") or shared_key
-        patient_key = patient_api_key or os.environ.get("GROQ_PATIENT_API_KEY", "") or shared_key
+        # Per-role models: each role can run a different Groq model so the
+        # Doctor (e.g. 8B for speed/quota) is independent of the Judges
+        # (70B for nuanced grading).
+        self._models: Dict[str, str] = {
+            "nurse":          nurse_model          or model,
+            "patient":        patient_model        or model,
+            "empathy_judge":  empathy_judge_model  or model,
+            "medical_judge":  medical_judge_model  or model,
+        }
 
-        # Create per-role Groq clients
-        self._clients: Dict[str, Any] = {"nurse": None, "patient": None}
+        # Resolve per-role API keys (explicit > role-specific env > shared)
+        shared_key      = api_key or os.environ.get("GROQ_API_KEY", "")
+        nurse_key       = nurse_api_key         or os.environ.get("GROQ_NURSE_API_KEY", "")          or shared_key
+        patient_key     = patient_api_key       or os.environ.get("GROQ_PATIENT_API_KEY", "")        or shared_key
+        empathy_key     = empathy_judge_api_key or os.environ.get("GROQ_EMPATHY_JUDGE_API_KEY", "")  or ""
+        medical_key     = medical_judge_api_key or os.environ.get("GROQ_MEDICAL_JUDGE_API_KEY", "")  or ""
+
+        # Create per-role Groq clients (4 logical roles).
+        # If a judge has no dedicated key, its client is left None and the
+        # corresponding evaluator silently falls back to the
+        # nurse / patient client (legacy behaviour) via _pick_live_client.
+        self._clients: Dict[str, Any] = {
+            "nurse":          None,
+            "patient":        None,
+            "empathy_judge":  None,
+            "medical_judge":  None,
+        }
 
         if GROQ_AVAILABLE:
-            if nurse_key:
-                self._clients["nurse"] = Groq(api_key=nurse_key)
-                logger.info("Nurse client: LIVE (Groq API)")
-            else:
-                logger.warning("No API key for Nurse. Using mock mode.")
-
-            if patient_key:
-                self._clients["patient"] = Groq(api_key=patient_key)
-                logger.info("Patient client: LIVE (Groq API)")
-            else:
-                logger.warning("No API key for Patient. Using mock mode.")
+            for role_name, role_key in [
+                ("nurse",         nurse_key),
+                ("patient",       patient_key),
+                ("empathy_judge", empathy_key),
+                ("medical_judge", medical_key),
+            ]:
+                if role_key:
+                    self._clients[role_name] = Groq(api_key=role_key)
+                    logger.info(
+                        f"{role_name} client: LIVE (Groq API, model={self._models[role_name]})"
+                    )
+                else:
+                    if role_name in {"empathy_judge", "medical_judge"}:
+                        logger.info(
+                            f"No dedicated key for {role_name}; will reuse "
+                            f"{'patient' if role_name == 'empathy_judge' else 'nurse'} client."
+                        )
+                    else:
+                        logger.warning(f"No API key for {role_name}. Using mock mode.")
         else:
-            logger.warning("groq package not installed. Both agents in mock mode.")
+            logger.warning("groq package not installed. All agents in mock mode.")
 
-        # Episode conversation histories: {"nurse": [...], "patient": [...]}
+        # Episode conversation histories: only the conversational roles
+        # (nurse / patient) actually carry a per-episode chat memory; the
+        # judges are stateless evaluators.
         self._memory: Dict[str, List[Dict[str, str]]] = {
             "nurse": [],
             "patient": [],
         }
+
+        # Tracks which Groq clients have permanently failed auth (HTTP 401
+        # or invalid_api_key) during this process. Once a client is in
+        # this set, the judges automatically route through the surviving
+        # client instead of retrying a dead key on every step.
+        self._dead_clients: set = set()
 
     # ----- Memory Management -----
 
@@ -207,25 +252,50 @@ class AgentRouter:
         # Build windowed context
         messages = self._get_windowed_messages(agent_role)
 
-        # Pick the correct client for this role
-        client = self._clients.get(agent_role)
+        # Build a fallback chain across ALL 4 client roles. The conversational
+        # role's own client is tried first; if dead, we walk through the
+        # remaining live clients in priority order (peer conversational role
+        # first, then the two judges) so the demo survives 3-of-4 dead keys.
+        if agent_role == "nurse":
+            attempt_order = ["nurse", "patient", "medical_judge", "empathy_judge"]
+        else:
+            attempt_order = ["patient", "nurse", "empathy_judge", "medical_judge"]
 
-        # --- API Call ---
-        if client is not None:
+        # Each role can run a different Groq model — pick the model
+        # registered for the *original* requested role even if we ended up
+        # using another client's key, so personas stay consistent.
+        role_model = self._models.get(agent_role, self.model)
+
+        raw_text = ""
+        attempted_any = False
+        for attempt_role in attempt_order:
+            if attempt_role in self._dead_clients:
+                continue
+            attempt_client = self._clients.get(attempt_role)
+            if attempt_client is None:
+                continue
+            attempted_any = True
             try:
-                completion = client.chat.completions.create(
-                    model=self.model,
+                completion = attempt_client.chat.completions.create(
+                    model=role_model,
                     messages=messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
                     response_format={"type": "json_object"},
                 )
                 raw_text = completion.choices[0].message.content or ""
+                break  # success → stop the cascade
             except Exception as e:
-                logger.error(f"Groq API error for {agent_role}: {e}")
-                raw_text = ""
-        else:
-            # --- Mock Mode: return a canned response ---
+                logger.error(
+                    f"Groq API error for {agent_role} (via {attempt_role} client, model={role_model}): {e}"
+                )
+                # Persist a 401 so subsequent steps don't keep retrying.
+                if self._mark_dead_if_auth_error(attempt_role, e):
+                    continue  # auth error → try the next client in the chain
+                break  # non-auth error → don't burn rate budget on every key
+
+        if not attempted_any:
+            # All four clients are dead or never configured.
             raw_text = self._mock_response(agent_role)
 
         # --- Parse JSON ---
@@ -242,6 +312,47 @@ class AgentRouter:
 
         return parsed
 
+    # ----- Live-client picker (auto-fallback for dead keys) -----
+
+    def _pick_live_client(self, primary: str, fallback: str):
+        """
+        Return the first non-dead Groq client in [primary, fallback].
+
+        When one of the demo Groq keys gets revoked / hits 401, the
+        corresponding role's client is added to ``self._dead_clients`` and
+        the judges silently route through the surviving key.
+        """
+        order = [primary, fallback]
+        for role in order:
+            if role in self._dead_clients:
+                continue
+            client = self._clients.get(role)
+            if client is not None:
+                return client, role
+        return None, None
+
+    def _mark_dead_if_auth_error(self, role: str, err: Exception) -> bool:
+        """
+        Inspect the exception. If it indicates an auth failure, blacklist
+        the client for the rest of this process and return True.
+        """
+        msg = str(err).lower()
+        if (
+            "401" in msg
+            or "invalid_api_key" in msg
+            or "invalid api key" in msg
+            or "unauthorized" in msg
+        ):
+            if role not in self._dead_clients:
+                logger.error(
+                    f"Groq client '{role}' failed auth (401). "
+                    f"Blacklisting for the rest of this session; "
+                    f"judges will route through the surviving key."
+                )
+                self._dead_clients.add(role)
+            return True
+        return False
+
     # ----- LLM-as-a-Judge Empathy Evaluation -----
 
     def evaluate_empathy(self, message: str) -> dict:
@@ -249,17 +360,22 @@ class AgentRouter:
         Use a 70B LLM to grade the Doctor's empathy and communication style.
         Returns dict with scores 0.0-1.0 for: empathy, explanation, dismissive, acknowledgment.
 
-        Routing: prefers the **patient** client so the Empathy Judge lives on
-        the same API key as the Doctor (Key A), leaving the Medical Judge
-        on the Nurse client (Key B) — which keeps both rate-limit budgets
-        independent.
+        Client routing (in order of preference):
+            1. ``empathy_judge`` — dedicated client (own Groq key)
+            2. ``patient``       — legacy fallback (shares Key A with Doctor)
+            3. ``nurse``         — last-resort fallback
+
+        Each fallback step is tried automatically if the previous client is
+        blacklisted (401) or hits an auth error mid-call.
         """
-        client = self._clients.get("patient") or self._clients.get("nurse")
         default_scores = {"empathy": 0.0, "explanation": 0.0, "dismissive": 0.0, "acknowledgment": 0.0}
-        
-        if client is None or not message:
+        if not message:
             return default_scores
 
+        # Routing order — dedicated client first, then legacy fallbacks.
+        attempt_order = ["empathy_judge", "patient", "nurse"]
+        # Models: empathy_judge uses its own model; legacy fallbacks use
+        # whatever model is registered for that role.
         judge_prompt = (
             "Analyze the following message from a Doctor to a patient/nurse.\n"
             f"Message: \"{message}\"\n\n"
@@ -272,31 +388,42 @@ class AgentRouter:
             '{"empathy": <float>, "explanation": <float>, "acknowledgment": <float>, "dismissive": <float>}'
         )
 
-        try:
-            completion = client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": "You are a communication analysis AI. Output ONLY valid JSON."},
-                    {"role": "user", "content": judge_prompt},
-                ],
-                temperature=0.1,
-                max_tokens=128,
-                response_format={"type": "json_object"},
-            )
-            raw_text = completion.choices[0].message.content or ""
-            parsed = _extract_json_from_text(raw_text)
+        for attempt_role in attempt_order:
+            if attempt_role in self._dead_clients:
+                continue
+            attempt_client = self._clients.get(attempt_role)
+            if attempt_client is None:
+                continue
+            attempt_model = self._models.get(attempt_role, self.model)
+            try:
+                completion = attempt_client.chat.completions.create(
+                    model=attempt_model,
+                    messages=[
+                        {"role": "system", "content": "You are a communication analysis AI. Output ONLY valid JSON."},
+                        {"role": "user", "content": judge_prompt},
+                    ],
+                    temperature=0.1,
+                    max_tokens=128,
+                    response_format={"type": "json_object"},
+                )
+                raw_text = completion.choices[0].message.content or ""
+                parsed = _extract_json_from_text(raw_text)
 
-            if parsed:
-                return {
-                    "empathy": max(0.0, min(1.0, float(parsed.get("empathy", 0.0)))),
-                    "explanation": max(0.0, min(1.0, float(parsed.get("explanation", 0.0)))),
-                    "acknowledgment": max(0.0, min(1.0, float(parsed.get("acknowledgment", 0.0)))),
-                    "dismissive": max(0.0, min(1.0, float(parsed.get("dismissive", 0.0)))),
-                }
-            return default_scores
-        except Exception as e:
-            logger.error(f"Empathy Judge API error: {e}")
-            return default_scores
+                if parsed:
+                    return {
+                        "empathy": max(0.0, min(1.0, float(parsed.get("empathy", 0.0)))),
+                        "explanation": max(0.0, min(1.0, float(parsed.get("explanation", 0.0)))),
+                        "acknowledgment": max(0.0, min(1.0, float(parsed.get("acknowledgment", 0.0)))),
+                        "dismissive": max(0.0, min(1.0, float(parsed.get("dismissive", 0.0)))),
+                    }
+                return default_scores
+            except Exception as e:
+                logger.error(f"Empathy Judge API error (via {attempt_role}, model={attempt_model}): {e}")
+                if self._mark_dead_if_auth_error(attempt_role, e):
+                    continue  # try the next role in attempt_order
+                return default_scores
+
+        return default_scores
 
     # ----- LLM-as-a-Judge Treatment Evaluation -----
 
@@ -314,11 +441,17 @@ class AgentRouter:
         Returns:
             {"score": float 0.0-1.0, "is_lethal": bool, "reasoning": str}
         """
-        # Treatment / Medical Judge: prefers nurse client → lives on Key B.
-        # Empathy Judge prefers patient client → lives on Key A. This keeps
-        # the two judges on independent API key buckets.
-        client = self._clients.get("nurse") or self._clients.get("patient")
-        if client is None:
+        # Routing order for the Medical Judge:
+        #     1. ``medical_judge`` — dedicated Groq key (preferred)
+        #     2. ``nurse``         — legacy fallback (shares Key B)
+        #     3. ``patient``       — last-resort fallback
+        # Each step is skipped if its client has been blacklisted (401).
+        attempt_order = ["medical_judge", "nurse", "patient"]
+        live_clients = [
+            r for r in attempt_order
+            if r not in self._dead_clients and self._clients.get(r) is not None
+        ]
+        if not live_clients:
             logger.warning("No API client available for LLM Judge. Returning default score.")
             return {"score": 0.5, "is_lethal": False, "reasoning": "No API client available."}
 
@@ -346,33 +479,47 @@ class AgentRouter:
             '{"score": <float 0.0-1.0>, "is_lethal": <bool>, "reasoning": "<brief explanation>"}'
         )
 
-        try:
-            completion = client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": "You are a medical evaluation AI. Output ONLY valid JSON."},
-                    {"role": "user", "content": judge_prompt},
-                ],
-                temperature=0.1,  # Low temp for consistent grading
-                max_tokens=256,
-                response_format={"type": "json_object"},
-            )
-            raw_text = completion.choices[0].message.content or ""
-            parsed = _extract_json_from_text(raw_text)
+        for attempt_role in live_clients:
+            if attempt_role in self._dead_clients:
+                continue
+            attempt_client = self._clients.get(attempt_role)
+            if attempt_client is None:
+                continue
+            attempt_model = self._models.get(attempt_role, self.model)
+            try:
+                completion = attempt_client.chat.completions.create(
+                    model=attempt_model,
+                    messages=[
+                        {"role": "system", "content": "You are a medical evaluation AI. Output ONLY valid JSON."},
+                        {"role": "user", "content": judge_prompt},
+                    ],
+                    temperature=0.1,  # Low temp for consistent grading
+                    max_tokens=256,
+                    response_format={"type": "json_object"},
+                )
+                raw_text = completion.choices[0].message.content or ""
+                parsed = _extract_json_from_text(raw_text)
 
-            if parsed and "score" in parsed:
-                score = max(0.0, min(1.0, float(parsed["score"])))
-                is_lethal = bool(parsed.get("is_lethal", False))
-                reasoning = parsed.get("reasoning", "")
-                logger.info(f"LLM Judge: score={score:.2f}, lethal={is_lethal}, reason={reasoning}")
-                return {"score": score, "is_lethal": is_lethal, "reasoning": reasoning}
-            else:
-                logger.warning(f"LLM Judge returned unparseable response: {raw_text[:200]}")
-                return {"score": 0.5, "is_lethal": False, "reasoning": "Judge response unparseable."}
+                if parsed and "score" in parsed:
+                    score = max(0.0, min(1.0, float(parsed["score"])))
+                    is_lethal = bool(parsed.get("is_lethal", False))
+                    reasoning = parsed.get("reasoning", "")
+                    logger.info(
+                        f"LLM Judge (via {attempt_role}, model={attempt_model}): "
+                        f"score={score:.2f}, lethal={is_lethal}, reason={reasoning}"
+                    )
+                    return {"score": score, "is_lethal": is_lethal, "reasoning": reasoning}
+                else:
+                    logger.warning(f"LLM Judge returned unparseable response: {raw_text[:200]}")
+                    return {"score": 0.5, "is_lethal": False, "reasoning": "Judge response unparseable."}
 
-        except Exception as e:
-            logger.error(f"LLM Judge API error: {e}")
-            return {"score": 0.5, "is_lethal": False, "reasoning": f"API error: {e}"}
+            except Exception as e:
+                logger.error(f"LLM Judge API error (via {attempt_role}, model={attempt_model}): {e}")
+                if self._mark_dead_if_auth_error(attempt_role, e):
+                    continue  # try the next role in attempt_order
+                return {"score": 0.5, "is_lethal": False, "reasoning": f"API error: {e}"}
+
+        return {"score": 0.5, "is_lethal": False, "reasoning": "All judge clients unavailable."}
 
     # ----- Mock Responses (for testing without API) -----
 

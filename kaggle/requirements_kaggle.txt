@@ -1,0 +1,35 @@
+# =====================================================================
+# ER-MAP — Kaggle Free-Tier Training Requirements
+# =====================================================================
+# Kaggle's GPU base image already ships with:
+#   - torch 2.x + CUDA 12.x
+#   - transformers
+#   - accelerate
+#   - peft
+#   - bitsandbytes
+#   - datasets
+# We only install what's missing or pinned-low. Order matters:
+# install unsloth LAST because it pins specific versions of xformers /
+# triton that should not be overwritten by other packages.
+# =====================================================================
+
+# --- Environment / RL plumbing ---
+gymnasium>=0.29.0
+openenv-core>=0.1.0
+
+# --- Per-step LLM API calls (Nurse / Patient / Judges via Groq) ---
+groq>=0.18.0
+
+# --- Logging ---
+wandb>=0.17.0
+
+# --- Hugging Face Hub push (so the trained adapter survives the 12h
+#     Kaggle session limit) ---
+huggingface_hub>=0.25.0
+
+# --- Training stack: install Unsloth LAST. Unsloth's setup pins exact
+#     versions of bitsandbytes / xformers / triton matched to the
+#     Kaggle CUDA image, and re-installing those after Unsloth tends
+#     to break the build. ---
+unsloth==2024.12.4
+trl>=0.11.0,<0.15.0

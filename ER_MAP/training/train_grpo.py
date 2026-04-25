@@ -4,11 +4,32 @@ ER_MAP/training/train_grpo.py
 GRPO (Group Relative Policy Optimization) Training Script with
 3-Phase Curriculum Learning for the ER-MAP Triage Environment.
 
-Key differences from PPO:
-- No value head / critic needed (simpler, more stable)
-- Uses group-relative rewards: compares G completions per prompt
-- Process-based rewards via verifier functions (not learned)
-- Curriculum scheduler controls phase transitions automatically
+Why a manual GRPO loop instead of TRL's GRPOTrainer?
+    TRL's GRPOTrainer expects (prompt, G completions) tuples and a
+    reward function with signature (prompts, completions, **kwargs)
+    -> list[float]. Our environment is multi-turn: a single "completion"
+    spans many env.step() calls and the reward is computed across the
+    whole trajectory by the env, not by a stateless reward function.
+    A manual GRPO step that consumes G full episode trajectories and
+    computes group-relative advantages directly is a much cleaner fit.
+
+Algorithm (manual GRPO):
+    1. Pick a scenario (phase + difficulty + seed) from the curriculum.
+    2. Sample G episodes from the policy with the SAME seed -> they
+       start in the same scenario but explore different action paths.
+    3. Compute total trajectory reward R_i for i = 1..G.
+    4. Group-relative advantage:  A_i = (R_i - mean(R)) / (std(R) + eps)
+    5. For each env step in each trajectory, compute the response
+       log-prob under the current policy and a reference policy.
+    6. Loss = - mean( A_i * sum_t logp_t ) + beta * mean(KL_t).
+    7. Backprop + optimizer step.
+
+Process-distributed reward shaping (see triage_env.py) means the trajectory
+reward is NOT terminal-dominated: intermediate diagnosis bonuses,
+critical-lab bonuses, milestones, and capped empathy rewards together
+account for ~60% of the maximum reward; the smoothed terminal judge +
+keyword combo accounts for ~40%. This is what makes GRPO actually learn
+on a long-horizon task.
 
 Usage (Colab / HF Spaces):
     !pip install unsloth trl transformers datasets accelerate peft
@@ -21,11 +42,14 @@ Usage (local dry-run, no GPU):
 
 import os
 import json
+import math
+import random
 import time
-import torch
 import logging
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass, field
+
+import torch
 
 logging.basicConfig(
     level=logging.INFO,
@@ -57,19 +81,16 @@ class CurriculumScheduler:
     Phase 1 (Tool Mastery):
         - Easy patients (calm, compliant)
         - Clean SOAP data
-        - Focus: learn to use tools correctly (read_soap, order_lab, speak_to)
-        - Promote when: win_rate >= 40% over last 20 episodes
+        - Promotion: win_rate >= 40% over last 20 episodes
 
     Phase 2 (Clinical Reasoning):
         - Mixed difficulty patients
-        - Noisy SOAP data (missing fields, vague history)
-        - Focus: differential diagnosis, correct lab ordering
-        - Promote when: win_rate >= 35% AND avg_reward >= 0.5
+        - Noisy SOAP data
+        - Promotion: win_rate >= 35% AND avg_reward >= 0.5
 
     Phase 3 (Empathetic Negotiation):
-        - Full persona randomization (hostile, non-compliant, uninsured)
+        - Full persona randomization
         - Heavy SOAP noise + behavioral friction
-        - Focus: empathy, trust-building, consent management
         - No promotion (final phase)
     """
 
@@ -97,7 +118,7 @@ class CurriculumScheduler:
             phase_id=3,
             difficulty="hard",
             min_episodes=50,
-            promotion_win_rate=1.0,   # Never auto-promote (final phase)
+            promotion_win_rate=1.0,
             promotion_avg_reward=99.0,
             description="Full persona randomization, trust-building, socio-economic barriers",
         ),
@@ -107,7 +128,7 @@ class CurriculumScheduler:
         self.current_phase_idx = 0
         self.phase_episode_count = 0
         self.phase_history: List[Dict[str, Any]] = []
-        self.window_size = 20  # Rolling window for promotion check
+        self.window_size = 20
 
     @property
     def current_phase(self) -> PhaseConfig:
@@ -118,9 +139,6 @@ class CurriculumScheduler:
         return self.current_phase.phase_id
 
     def record_episode(self, outcome: str, total_reward: float) -> bool:
-        """
-        Record an episode result. Returns True if phase was promoted.
-        """
         self.phase_episode_count += 1
         self.phase_history.append({
             "outcome": outcome,
@@ -128,15 +146,13 @@ class CurriculumScheduler:
             "phase": self.phase_id,
         })
 
-        # Check promotion
         if self.current_phase_idx >= len(self.PHASES) - 1:
-            return False  # Already at final phase
+            return False
 
         cfg = self.current_phase
         if self.phase_episode_count < cfg.min_episodes:
-            return False  # Not enough episodes yet
+            return False
 
-        # Calculate rolling metrics
         recent = self.phase_history[-self.window_size:]
         win_rate = sum(1 for e in recent if e["outcome"] == "WIN") / len(recent)
         avg_reward = sum(e["reward"] for e in recent) / len(recent)
@@ -147,7 +163,6 @@ class CurriculumScheduler:
         return False
 
     def _promote(self):
-        """Advance to the next phase."""
         old_phase = self.current_phase.name
         self.current_phase_idx += 1
         self.phase_episode_count = 0
@@ -158,14 +173,12 @@ class CurriculumScheduler:
         )
 
     def get_env_options(self) -> Dict[str, Any]:
-        """Return options dict to pass to env.reset()."""
         return {
             "phase": self.phase_id,
             "difficulty": self.current_phase.difficulty,
         }
 
     def get_summary(self) -> Dict[str, Any]:
-        """Return scheduler state for logging."""
         recent = self.phase_history[-self.window_size:] if self.phase_history else []
         win_rate = sum(1 for e in recent if e["outcome"] == "WIN") / max(len(recent), 1)
         avg_reward = sum(e["reward"] for e in recent) / max(len(recent), 1)
@@ -180,16 +193,16 @@ class CurriculumScheduler:
 
 
 # ============================================================================
-# Reward Verifier (process-based, no learned critic)
+# Trajectory-level Verifier (process-aware, no learned critic)
 # ============================================================================
 
-def verify_episode_reward(trajectory: Dict[str, Any]) -> float:
+def verify_trajectory_reward(trajectory: Dict[str, Any]) -> float:
     """
-    Compute a normalized episode-level reward for GRPO.
-    This is the 'verifier' function that replaces the critic in PPO.
+    Compute the verified scalar reward for a full episode trajectory.
 
-    The environment already computes dense per-step rewards.
-    We aggregate them and add episode-level bonuses.
+    Uses the env's per-component reward tracking (rebalanced so that
+    process rewards dominate terminal rewards) plus a few outcome-level
+    bonuses/penalties. Returns a single float used as R_i for GRPO.
     """
     total = trajectory.get("total_reward", 0.0)
     outcome = trajectory.get("outcome", "unknown")
@@ -197,32 +210,29 @@ def verify_episode_reward(trajectory: Dict[str, Any]) -> float:
     milestones = trajectory.get("milestones", {})
     patient_state = trajectory.get("patient_state", {})
 
-    # Outcome bonus (verified result)
+    # Outcome bonus is intentionally SMALL since the env's terminal reward
+    # is already smoothed in [-1.1, +0.6]. We do not double-count.
     outcome_bonus = {
-        "WIN": 2.0,
-        "FATAL_LOSS": -3.0,
-        "AMA_LOSS": -1.5,
-        "INCORRECT": -2.0,
-        "unknown": -0.5,
-    }.get(outcome, -0.5)
+        "WIN":         0.30,
+        "FATAL_LOSS": -0.40,
+        "AMA_LOSS":   -0.20,
+        "INCORRECT":  -0.20,
+        "PARTIAL":     0.00,
+        "unknown":    -0.10,
+    }.get(outcome, -0.10)
 
-    # Efficiency bonus: fewer steps = better (caps at 5 steps)
-    efficiency = max(0, 1.0 - (steps / 20))  # 0 at 20 steps, 1.0 at 0 steps
-
-    # Milestone completion bonus
+    efficiency = max(0.0, 1.0 - (steps / 20.0))
     completion = milestones.get("completion", 0.0) if isinstance(milestones, dict) else 0.0
-    milestone_bonus = completion * 0.5
+    milestone_bonus = completion * 0.30
 
-    # Trust maintenance bonus (Phase 3 relevant)
     trust = patient_state.get("trust", 50) if isinstance(patient_state, dict) else 50
-    trust_bonus = 0.2 if trust > 60 else (-0.1 if trust < 30 else 0.0)
+    trust_bonus = 0.10 if trust > 60 else (-0.05 if trust < 30 else 0.0)
 
-    verified_reward = total + outcome_bonus + efficiency * 0.3 + milestone_bonus + trust_bonus
-    return verified_reward
+    return total + outcome_bonus + efficiency * 0.15 + milestone_bonus + trust_bonus
 
 
 # ============================================================================
-# Model Loading (reused from train_ppo.py)
+# Model Loading
 # ============================================================================
 
 def load_model_and_tokenizer(
@@ -281,6 +291,36 @@ def load_model_and_tokenizer(
         return model, tokenizer
 
 
+def load_reference_model(model_name: str, max_seq_length: int = 2048):
+    """
+    Load a frozen reference policy for KL regularization in GRPO.
+    The reference is the un-LoRA'd base model (no adapters, no grad).
+    """
+    try:
+        from unsloth import FastLanguageModel
+        ref_model, _ = FastLanguageModel.from_pretrained(
+            model_name=model_name,
+            max_seq_length=max_seq_length,
+            load_in_4bit=True,
+            dtype=None,
+        )
+        ref_model.eval()
+        for p in ref_model.parameters():
+            p.requires_grad_(False)
+        return ref_model
+    except ImportError:
+        from transformers import AutoModelForCausalLM
+        ref_model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.float16,
+            device_map="auto",
+        )
+        ref_model.eval()
+        for p in ref_model.parameters():
+            p.requires_grad_(False)
+        return ref_model
+
+
 # ============================================================================
 # Doctor Action Generation
 # ============================================================================
@@ -292,10 +332,13 @@ AVAILABLE TOOLS (respond with JSON):
 2. {"tool": "speak_to", "target": "patient", "message": "..."} - Talk to patient
 3. {"tool": "speak_to", "target": "nurse", "message": "..."} - Talk to nurse
 4. {"tool": "order_lab", "test_name": "..."} - Order a lab test
-5. {"tool": "update_soap", "section": "...", "content": "..."} - Update medical record
-6. {"tool": "terminal_discharge", "treatment": "...", "diagnosis": "..."} - Final diagnosis
+5. {"tool": "update_soap", "section": "Assessment|Plan", "content": "..."} - Update medical record
+6. {"tool": "terminal_discharge", "treatment": "...", "is_emergency": true|false} - Final diagnosis
 
-WORKFLOW: Read SOAP -> Talk to patient -> Order labs -> Assess -> Diagnose & Treat
+WORKFLOW: Read SOAP -> Talk to patient -> Order labs -> Update Assessment -> Update Plan -> Discharge
+
+Document your reasoning in update_soap before discharge: the env rewards
+intermediate diagnosis quality, not just final treatment.
 
 Respond with ONLY a valid JSON action object."""
 
@@ -306,6 +349,7 @@ def generate_doctor_action(
     observation: str,
     device: str = "cuda",
     max_new_tokens: int = 256,
+    temperature: float = 0.7,
 ) -> str:
     """Generate Doctor's JSON action from observation."""
     prompt = f"{DOCTOR_SYSTEM_PROMPT}\n\nObservation:\n{observation}\n\nJSON Action:"
@@ -317,7 +361,7 @@ def generate_doctor_action(
         outputs = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
-            temperature=0.7,
+            temperature=temperature,
             do_sample=True,
             pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
         )
@@ -338,34 +382,47 @@ def run_episode(
     tokenizer,
     env,
     env_options: Dict[str, Any],
+    seed: Optional[int] = None,
     device: str = "cuda",
+    temperature: float = 0.7,
 ) -> Dict[str, Any]:
     """
-    Run a single episode. Returns trajectory data for GRPO.
+    Run a single episode. Returns a trajectory dict with the full
+    (prompt, response) sequence and per-component reward decomposition.
     """
-    obs, info = env.reset(options=env_options)
+    obs, info = env.reset(seed=seed, options=env_options)
     done = False
     truncated = False
 
-    queries: List[str] = []
-    responses: List[str] = []
-    rewards: List[float] = []
+    prompts: List[str] = []        # full prompts including DOCTOR_SYSTEM_PROMPT
+    responses: List[str] = []      # the doctor's JSON action
+    step_rewards: List[float] = []
     total_reward = 0.0
     steps = 0
     outcome = "unknown"
     last_info = info
+    final_components: Dict[str, float] = {}
 
     while not done and not truncated:
-        action_text = generate_doctor_action(model, tokenizer, obs, device=device)
+        prompt = (
+            f"{DOCTOR_SYSTEM_PROMPT}\n\n"
+            f"Observation:\n{obs}\n\n"
+            f"JSON Action:"
+        )
+        action_text = generate_doctor_action(
+            model, tokenizer, obs, device=device, temperature=temperature
+        )
 
         next_obs, reward, done, truncated, info = env.step(action_text)
 
-        queries.append(obs)
+        prompts.append(prompt)
         responses.append(action_text)
-        rewards.append(reward)
-        total_reward += reward
+        step_rewards.append(float(reward))
+        total_reward += float(reward)
         steps += 1
         last_info = info
+        if "reward_components" in info:
+            final_components = dict(info["reward_components"])
         obs = next_obs
 
         if done:
@@ -380,19 +437,206 @@ def run_episode(
                     outcome = "AMA_LOSS"
                 elif "incorrect" in event:
                     outcome = "INCORRECT"
+                elif "partial" in event:
+                    outcome = "PARTIAL"
             except json.JSONDecodeError:
                 pass
 
     return {
-        "queries": queries,
+        "prompts": prompts,
         "responses": responses,
-        "rewards": rewards,
+        "step_rewards": step_rewards,
         "total_reward": total_reward,
         "steps": steps,
         "outcome": outcome,
         "milestones": last_info.get("milestones", {}),
         "patient_state": last_info.get("patient_state", {}),
+        "reward_components": final_components,
     }
+
+
+# ============================================================================
+# Manual GRPO Update Step
+# ============================================================================
+
+def _response_logprob(
+    model,
+    tokenizer,
+    prompt: str,
+    response: str,
+    device: str,
+    max_seq_length: int = 2048,
+) -> Tuple[torch.Tensor, int]:
+    """
+    Compute the sum of token-level log-probs of `response` under `model`,
+    conditional on `prompt`. Returns (sum_logprob_tensor, num_tokens).
+    The returned tensor remains on the autograd graph if model has
+    requires_grad enabled.
+    """
+    full = prompt + response
+    full_ids = tokenizer(
+        full, return_tensors="pt", truncation=True, max_length=max_seq_length
+    ).input_ids.to(device)
+    prompt_ids = tokenizer(
+        prompt, return_tensors="pt", truncation=True, max_length=max_seq_length - 8
+    ).input_ids.to(device)
+    prompt_len = prompt_ids.shape[1]
+    seq_len = full_ids.shape[1]
+
+    if seq_len <= prompt_len:
+        return torch.tensor(0.0, device=device, requires_grad=False), 0
+
+    logits = model(full_ids).logits  # [1, L, V]
+    log_probs = torch.log_softmax(logits[:, :-1, :], dim=-1)  # predict next token
+    target_ids = full_ids[:, 1:]  # [1, L-1]
+    token_logp = torch.gather(
+        log_probs, -1, target_ids.unsqueeze(-1)
+    ).squeeze(-1)  # [1, L-1]
+
+    # Mask: only the response tokens contribute. The prediction at position
+    # (prompt_len - 1) is the first response token.
+    mask = torch.zeros_like(token_logp)
+    mask[:, prompt_len - 1:] = 1.0
+    n_tokens = int(mask.sum().item())
+    sum_logp = (token_logp * mask).sum()
+    return sum_logp, n_tokens
+
+
+def manual_grpo_step(
+    model,
+    ref_model,
+    tokenizer,
+    trajectories: List[Dict[str, Any]],
+    optimizer,
+    beta: float = 0.04,
+    device: str = "cuda",
+) -> Dict[str, float]:
+    """
+    Apply one GRPO update over a group of G trajectories that share the
+    same scenario (same env seed and options).
+
+    Loss formulation:
+        A_i  = (R_i - mean(R)) / (std(R) + eps)         # group-relative
+        L    = - mean_i ( A_i * mean_t logp_pi(a_t|s_t) )
+               + beta * mean_t ( logp_pi - logp_ref ) ** 2
+
+    The KL term is computed implicitly as a squared log-ratio (a stable
+    surrogate for low-magnitude policy drift). Token-level masking
+    ensures we only learn from response tokens, not prompt tokens.
+    """
+    if not trajectories:
+        return {"loss": 0.0, "kl": 0.0, "n_steps": 0}
+
+    rewards = torch.tensor(
+        [verify_trajectory_reward(t) for t in trajectories],
+        device=device, dtype=torch.float32,
+    )
+    if rewards.numel() < 2 or rewards.std().item() < 1e-6:
+        # All trajectories same reward -> no signal; skip the update.
+        return {
+            "loss": 0.0, "kl": 0.0, "n_steps": 0,
+            "advantages_mean": 0.0, "advantages_std": 0.0,
+            "skipped": True,
+        }
+
+    advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+
+    total_loss = torch.zeros((), device=device)
+    total_kl = 0.0
+    n_steps = 0
+
+    for traj_idx, traj in enumerate(trajectories):
+        adv = advantages[traj_idx]
+        for prompt, response in zip(traj["prompts"], traj["responses"]):
+            logp_pi, n_tok = _response_logprob(
+                model, tokenizer, prompt, response, device
+            )
+            if n_tok == 0:
+                continue
+
+            with torch.no_grad():
+                logp_ref, _ = _response_logprob(
+                    ref_model, tokenizer, prompt, response, device
+                )
+
+            # Length-normalize so long responses don't dominate.
+            logp_pi_norm = logp_pi / max(n_tok, 1)
+            logp_ref_norm = logp_ref / max(n_tok, 1)
+
+            policy_term = -(adv * logp_pi_norm)
+            kl_term = (logp_pi_norm - logp_ref_norm).pow(2)
+            step_loss = policy_term + beta * kl_term
+
+            total_loss = total_loss + step_loss
+            total_kl += float((logp_pi_norm - logp_ref_norm).abs().detach().item())
+            n_steps += 1
+
+    if n_steps == 0:
+        return {"loss": 0.0, "kl": 0.0, "n_steps": 0}
+
+    total_loss = total_loss / n_steps
+
+    optimizer.zero_grad()
+    total_loss.backward()
+    torch.nn.utils.clip_grad_norm_(
+        [p for p in model.parameters() if p.requires_grad],
+        max_norm=1.0,
+    )
+    optimizer.step()
+
+    return {
+        "loss": float(total_loss.item()),
+        "kl": total_kl / n_steps,
+        "n_steps": n_steps,
+        "advantages_mean": float(advantages.mean().item()),
+        "advantages_std": float(advantages.std().item()),
+        "rewards_mean": float(rewards.mean().item()),
+        "rewards_std": float(rewards.std().item()),
+        "skipped": False,
+    }
+
+
+# ============================================================================
+# Save / Merge Path
+# ============================================================================
+
+def save_lora_adapters(model, tokenizer, output_dir: str) -> None:
+    """Save just the LoRA adapter weights — safe and small."""
+    os.makedirs(output_dir, exist_ok=True)
+    model.save_pretrained(output_dir)
+    tokenizer.save_pretrained(output_dir)
+    logger.info(f"Saved LoRA adapters to {output_dir}")
+
+
+def merge_and_save_fp16(model, tokenizer, output_dir: str) -> None:
+    """
+    Properly merge LoRA into the base model and save in fp16.
+    This is the correct path warned about in §16 of the hackathon guide:
+    we do NOT naively upcast a 4-bit base then merge — we use the unsloth
+    helper when available, which handles the merge in fp16 directly.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    try:
+        # Unsloth provides save_pretrained_merged that does this safely.
+        if hasattr(model, "save_pretrained_merged"):
+            model.save_pretrained_merged(
+                output_dir, tokenizer, save_method="merged_16bit"
+            )
+            logger.info(f"Merged-and-saved (unsloth fp16) to {output_dir}")
+            return
+    except Exception as e:
+        logger.warning(f"Unsloth merged save failed: {e}. Falling back to PEFT merge.")
+
+    try:
+        merged = model.merge_and_unload()
+        merged.save_pretrained(output_dir, safe_serialization=True)
+        tokenizer.save_pretrained(output_dir)
+        logger.info(f"Merged-and-saved (peft) to {output_dir}")
+    except Exception as e:
+        logger.error(
+            f"Merge-and-save failed: {e}. Saved adapters only as fallback."
+        )
+        save_lora_adapters(model, tokenizer, output_dir)
 
 
 # ============================================================================
@@ -402,197 +646,366 @@ def run_episode(
 def train(
     num_episodes: int = 200,
     group_size: int = 4,
-    model_name: str = "unsloth/Qwen3-4B",
+    model_name: str = "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit",
     groq_api_key: str = "",
     learning_rate: float = 5e-6,
+    kl_beta: float = 0.04,
     use_wandb: bool = False,
     output_dir: str = "./er_map_grpo_checkpoints",
     dry_run: bool = False,
+    *,
+    # ---------------- Early-stopping ("train until optimal") ---------------
+    # Stop training as soon as the policy sustains BOTH:
+    #   rolling_avg_reward >= target_rolling_reward
+    #   rolling_win_rate   >= target_win_rate
+    # for `convergence_window` consecutive GRPO groups, while in phase
+    # `convergence_min_phase` or above. `num_episodes` becomes a HARD CAP.
+    target_rolling_reward: float = 1.5,
+    target_win_rate: float = 0.40,
+    convergence_window: int = 5,
+    convergence_min_phase: int = 3,
+    early_stop: bool = True,
 ):
     """
     Main GRPO training loop with curriculum scheduling.
 
-    Args:
-        num_episodes: Total training episodes across all phases
-        group_size: G completions per prompt for GRPO (default 4)
-        model_name: Base model (Qwen3-4B recommended for $200 budget)
-        groq_api_key: For Nurse/Patient LLM APIs
-        learning_rate: GRPO learning rate
-        use_wandb: Enable W&B logging
-        output_dir: Checkpoint directory
-        dry_run: If True, skip model loading (test scheduler only)
+    Each "episode" in the outer counter corresponds to a single trajectory.
+    Trajectories are gathered in groups of `group_size` sharing the same
+    scenario (same seed + env_options) and then a manual_grpo_step is run
+    over the group. So one optimizer update consumes group_size episodes.
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info(f"Device: {device}")
-    logger.info(f"GRPO Config: group_size={group_size}, lr={learning_rate}")
+    logger.info(
+        f"GRPO Config: group_size={group_size}, lr={learning_rate}, "
+        f"kl_beta={kl_beta}"
+    )
 
     groq_key = groq_api_key or os.environ.get("GROQ_API_KEY", "")
 
-    # --- Curriculum Scheduler ---
     scheduler = CurriculumScheduler()
     logger.info(f"Starting Phase: {scheduler.current_phase.name}")
     logger.info(f"  {scheduler.current_phase.description}")
 
-    # --- Model ---
+    # --- Model / reference / optimizer ---
     if not dry_run:
         model, tokenizer = load_model_and_tokenizer(model_name=model_name)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
+        ref_model = load_reference_model(model_name)
+        trainable = [p for p in model.parameters() if p.requires_grad]
+        optimizer = torch.optim.AdamW(trainable, lr=learning_rate)
     else:
-        model, tokenizer = None, None
+        model, tokenizer, ref_model, optimizer = None, None, None, None
         logger.info("DRY RUN mode -- skipping model loading")
 
-    # --- GRPO Trainer (TRL) ---
-    use_trl = False
-    grpo_trainer = None
-    if not dry_run:
+    # --- W&B ---
+    wandb_run = None
+    if use_wandb and not dry_run:
         try:
-            from trl import GRPOConfig, GRPOTrainer
-
-            grpo_config = GRPOConfig(
-                output_dir=output_dir,
-                learning_rate=learning_rate,
-                num_generations=group_size,
-                max_completion_length=256,
-                log_with="wandb" if use_wandb else None,
-                per_device_train_batch_size=1,
-                gradient_accumulation_steps=group_size,
+            import wandb
+            wandb_run = wandb.init(
+                project="er-map-grpo",
+                config={
+                    "model_name": model_name,
+                    "num_episodes": num_episodes,
+                    "group_size": group_size,
+                    "learning_rate": learning_rate,
+                    "kl_beta": kl_beta,
+                },
             )
-
-            grpo_trainer = GRPOTrainer(
-                model=model,
-                processing_class=tokenizer,
-                config=grpo_config,
-                reward_funcs=verify_episode_reward,
-            )
-            use_trl = True
-            logger.info("TRL GRPOTrainer initialized successfully.")
-
-        except (ImportError, Exception) as e:
-            logger.warning(f"TRL GRPO not available ({e}). Running manual GRPO loop.")
+        except Exception as e:
+            logger.warning(f"W&B init failed: {e}. Continuing without it.")
 
     # --- Environment ---
     from ER_MAP.envs.triage_env import TriageEnv
+    env = None if dry_run else TriageEnv(groq_api_key=groq_key, render_mode=None)
 
-    env = TriageEnv(groq_api_key=groq_key, render_mode="human")
-
-    # --- Training Loop ---
     os.makedirs(output_dir, exist_ok=True)
     metrics_log: List[Dict[str, Any]] = []
     start_time = time.time()
+    episode_idx = 0
 
-    logger.info(f"\nStarting GRPO training for {num_episodes} episodes...")
-    logger.info(f"Phase 1: {scheduler.PHASES[0].description}")
+    # Convergence tracking: deque of (phase, avg_reward, win_rate) for the
+    # last `convergence_window` GRPO groups. Used by the early-stopping
+    # check at the bottom of each iteration of the outer loop.
+    from collections import deque as _deque
+    convergence_buffer: _deque = _deque(maxlen=max(1, int(convergence_window)))
+    converged: bool = False
 
-    for episode_idx in range(1, num_episodes + 1):
-        ep_start = time.time()
+    logger.info(f"\nStarting GRPO training for up to {num_episodes} episodes "
+                f"(={num_episodes // group_size} GRPO updates)")
+    if early_stop:
+        logger.info(
+            f"  Early-stop ON: target rolling-avg-reward >= {target_rolling_reward:+.2f} "
+            f"AND win-rate >= {target_win_rate:.0%} sustained for "
+            f"{convergence_window} groups in phase >= {convergence_min_phase}"
+        )
+    else:
+        logger.info("  Early-stop OFF: will run all configured episodes.")
 
-        # Get phase-aware env options
+    # Outer loop: one iteration = one GRPO update over `group_size` episodes
+    while episode_idx < num_episodes:
         env_options = scheduler.get_env_options()
+        group_seed = random.randint(0, 1_000_000)
 
-        logger.info(f"\n{'=' * 60}")
-        logger.info(
-            f"  Episode {episode_idx}/{num_episodes} | "
-            f"Phase {scheduler.phase_id}: {scheduler.current_phase.name} | "
-            f"Difficulty: {env_options.get('difficulty', 'random')}"
-        )
-        logger.info(f"{'=' * 60}")
+        trajectories: List[Dict[str, Any]] = []
+        group_outcomes: List[str] = []
+        group_rewards: List[float] = []
 
-        if dry_run:
-            # Simulate a trajectory for testing the scheduler
-            import random
-            outcome = random.choice(["WIN", "WIN", "FATAL_LOSS", "INCORRECT", "WIN"])
-            total_reward = random.uniform(-1.0, 2.0) if outcome == "WIN" else random.uniform(-3.0, 0.0)
-            trajectory = {
-                "queries": [], "responses": [], "rewards": [],
-                "total_reward": total_reward, "steps": random.randint(3, 15),
-                "outcome": outcome, "milestones": {"completion": random.uniform(0.3, 1.0)},
-                "patient_state": {"trust": random.uniform(20, 80)},
+        # --- Collect G trajectories under same scenario ---
+        for g in range(group_size):
+            episode_idx += 1
+            ep_start = time.time()
+
+            logger.info(
+                f"\n{'=' * 60}\n"
+                f"  Episode {episode_idx}/{num_episodes} | Group {g+1}/{group_size} | "
+                f"Phase {scheduler.phase_id}: {scheduler.current_phase.name} | "
+                f"Difficulty: {env_options.get('difficulty', 'random')} | "
+                f"Seed: {group_seed}\n"
+                f"{'=' * 60}"
+            )
+
+            if dry_run:
+                outcome = random.choice(["WIN", "WIN", "FATAL_LOSS", "INCORRECT", "PARTIAL"])
+                total_reward = (
+                    random.uniform(0.5, 2.0) if outcome == "WIN"
+                    else random.uniform(-2.0, 0.3)
+                )
+                trajectory = {
+                    "prompts": [], "responses": [], "step_rewards": [],
+                    "total_reward": total_reward,
+                    "steps": random.randint(3, 15),
+                    "outcome": outcome,
+                    "milestones": {"completion": random.uniform(0.3, 1.0)},
+                    "patient_state": {"trust": random.uniform(20, 80)},
+                    "reward_components": {
+                        "process": random.uniform(0.1, 0.6),
+                        "diagnosis": random.uniform(0.0, 0.3),
+                        "plan": random.uniform(0.0, 0.25),
+                        "labs": random.uniform(0.0, 0.4),
+                        "treatment": random.uniform(-0.4, 0.6),
+                        "empathy": random.uniform(-0.1, 0.3),
+                        "milestones": random.uniform(0.0, 0.3),
+                        "consent": random.uniform(-0.5, 0.25),
+                        "documentation": random.uniform(-0.3, 0.4),
+                        "emergency_id": random.uniform(-0.3, 0.3),
+                        "penalties": random.uniform(-0.3, 0.0),
+                    },
+                }
+            else:
+                trajectory = run_episode(
+                    model, tokenizer, env, env_options,
+                    seed=group_seed, device=device,
+                )
+
+            trajectories.append(trajectory)
+            group_outcomes.append(trajectory["outcome"])
+            group_rewards.append(trajectory["total_reward"])
+
+            verified = verify_trajectory_reward(trajectory)
+            comp = trajectory.get("reward_components", {})
+
+            logger.info(
+                f"  Outcome: {trajectory['outcome']} | "
+                f"Steps: {trajectory['steps']} | "
+                f"Raw: {trajectory['total_reward']:+.3f} | "
+                f"Verified: {verified:+.3f} | "
+                f"Process: {comp.get('process', 0) + comp.get('milestones', 0) + comp.get('labs', 0) + comp.get('diagnosis', 0) + comp.get('plan', 0):+.2f} | "
+                f"Terminal: {comp.get('treatment', 0) + comp.get('emergency_id', 0):+.2f}"
+            )
+
+            promoted = scheduler.record_episode(
+                trajectory["outcome"], trajectory["total_reward"]
+            )
+            if promoted:
+                logger.info(
+                    f"  >>> PROMOTED to Phase {scheduler.phase_id}: "
+                    f"{scheduler.current_phase.name}"
+                )
+
+            ep_time = time.time() - ep_start
+            sched_summary = scheduler.get_summary()
+            metrics_log.append({
+                "episode": episode_idx,
+                "group_idx": g,
+                "group_seed": group_seed,
+                "phase": sched_summary["phase"],
+                "phase_name": sched_summary["phase_name"],
+                "outcome": trajectory["outcome"],
+                "steps": trajectory["steps"],
+                "raw_reward": round(trajectory["total_reward"], 3),
+                "verified_reward": round(verified, 3),
+                "rolling_win_rate": sched_summary["rolling_win_rate"],
+                "rolling_avg_reward": sched_summary["rolling_avg_reward"],
+                "milestones": trajectory.get("milestones", {}),
+                "reward_components": comp,
+                "patient_trust": trajectory.get("patient_state", {}).get("trust"),
+                "episode_time_s": round(ep_time, 1),
+            })
+
+        # In dry-run we don't actually run a GRPO step, but we still
+        # synthesize plausible update stats so the per-phase plotter has
+        # something to render during development / smoke tests.
+        if dry_run and trajectories and metrics_log:
+            metrics_log[-1]["grpo_update"] = {
+                "loss":         round(random.uniform(-0.6, 0.4), 5),
+                "kl":           round(random.uniform(0.001, 0.08), 5),
+                "adv_mean":     round(random.uniform(-0.05, 0.05), 4),
+                "adv_std":      round(random.uniform(0.4, 1.6), 4),
+                "rewards_mean": round(sum(group_rewards) / max(len(group_rewards), 1), 4),
+                "rewards_std":  round((max(group_rewards) - min(group_rewards)) / 2.0
+                                      if len(group_rewards) > 1 else 0.1, 4),
+                "n_steps":      sum(t["steps"] for t in trajectories),
+                "skipped":      False,
             }
-        else:
-            # Real rollout
-            trajectory = run_episode(model, tokenizer, env, env_options, device=device)
 
-        # Verify reward
-        verified_reward = verify_episode_reward(trajectory)
-
-        logger.info(
-            f"  Outcome: {trajectory['outcome']} | "
-            f"Steps: {trajectory['steps']} | "
-            f"Raw Reward: {trajectory['total_reward']:+.3f} | "
-            f"Verified: {verified_reward:+.3f}"
-        )
-
-        # --- GRPO Update (if TRL available) ---
-        if use_trl and grpo_trainer and trajectory["queries"]:
+        # --- GRPO update over the group ---
+        if not dry_run and trajectories:
             try:
-                # For GRPO, we batch G completions per prompt
-                # In our env-based setup, each episode is one "completion"
-                # We accumulate group_size episodes before updating
-                pass  # TRL GRPOTrainer handles batching internally
+                stats = manual_grpo_step(
+                    model, ref_model, tokenizer, trajectories,
+                    optimizer, beta=kl_beta, device=device,
+                )
+                logger.info(
+                    f"  [GRPO] loss={stats.get('loss', 0):+.4f} | "
+                    f"kl={stats.get('kl', 0):+.4f} | "
+                    f"adv_mean={stats.get('advantages_mean', 0):+.3f} | "
+                    f"adv_std={stats.get('advantages_std', 0):+.3f} | "
+                    f"n_steps={stats.get('n_steps', 0)} | "
+                    f"skipped={stats.get('skipped', False)}"
+                )
+                # Stamp the GRPO update stats onto the LAST metric of this
+                # group so the per-phase plotter can correlate update-level
+                # stats (loss / kl / advantages) with episode-level rewards.
+                if metrics_log:
+                    metrics_log[-1]["grpo_update"] = {
+                        "loss":           round(float(stats.get("loss", 0.0)), 5),
+                        "kl":             round(float(stats.get("kl", 0.0)), 5),
+                        "adv_mean":       round(float(stats.get("advantages_mean", 0.0)), 4),
+                        "adv_std":        round(float(stats.get("advantages_std", 0.0)), 4),
+                        "rewards_mean":   round(float(stats.get("rewards_mean", 0.0)), 4),
+                        "rewards_std":    round(float(stats.get("rewards_std", 0.0)), 4),
+                        "n_steps":        int(stats.get("n_steps", 0)),
+                        "skipped":        bool(stats.get("skipped", False)),
+                    }
+                if wandb_run:
+                    wandb_run.log({
+                        "grpo/loss": stats.get("loss", 0.0),
+                        "grpo/kl": stats.get("kl", 0.0),
+                        "grpo/adv_mean": stats.get("advantages_mean", 0.0),
+                        "grpo/adv_std": stats.get("advantages_std", 0.0),
+                        "grpo/n_steps": stats.get("n_steps", 0),
+                        "phase": scheduler.phase_id,
+                        "rolling_win_rate": scheduler.get_summary()["rolling_win_rate"],
+                        "rolling_avg_reward": scheduler.get_summary()["rolling_avg_reward"],
+                    })
             except Exception as e:
                 logger.error(f"  GRPO update failed: {e}")
 
-        # Record for curriculum scheduler
-        promoted = scheduler.record_episode(trajectory["outcome"], trajectory["total_reward"])
-
-        if promoted:
-            logger.info(f"  >>> PROMOTED to Phase {scheduler.phase_id}: {scheduler.current_phase.name}")
-
-        # Log metrics
-        ep_time = time.time() - ep_start
-        sched_summary = scheduler.get_summary()
-        episode_metrics = {
-            "episode": episode_idx,
-            "phase": sched_summary["phase"],
-            "phase_name": sched_summary["phase_name"],
-            "outcome": trajectory["outcome"],
-            "steps": trajectory["steps"],
-            "raw_reward": round(trajectory["total_reward"], 3),
-            "verified_reward": round(verified_reward, 3),
-            "rolling_win_rate": sched_summary["rolling_win_rate"],
-            "rolling_avg_reward": sched_summary["rolling_avg_reward"],
-            "milestones": trajectory.get("milestones", {}),
-            "patient_trust": trajectory.get("patient_state", {}).get("trust", None),
-            "episode_time_s": round(ep_time, 1),
-        }
-        metrics_log.append(episode_metrics)
-
-        # Periodic checkpoint
-        if episode_idx % 25 == 0:
-            ckpt_path = os.path.join(output_dir, f"checkpoint_ep{episode_idx}_phase{scheduler.phase_id}")
+        # --- Periodic checkpoint (LoRA adapters) ---
+        if episode_idx % (group_size * 5) == 0 and not dry_run:
+            ckpt_path = os.path.join(
+                output_dir,
+                f"checkpoint_ep{episode_idx}_phase{scheduler.phase_id}",
+            )
             try:
-                if not dry_run:
-                    model.save_pretrained(ckpt_path)
-                    tokenizer.save_pretrained(ckpt_path)
-                    logger.info(f"  Checkpoint saved: {ckpt_path}")
+                save_lora_adapters(model, tokenizer, ckpt_path)
             except Exception as e:
                 logger.error(f"  Checkpoint failed: {e}")
 
-            # Save intermediate metrics
             metrics_path = os.path.join(output_dir, "training_metrics.json")
             with open(metrics_path, "w") as f:
                 json.dump(metrics_log, f, indent=2)
 
-        # Log rolling stats every 5 episodes
-        if episode_idx % 5 == 0:
-            s = scheduler.get_summary()
+        # --- Rolling stats every group ---
+        s = scheduler.get_summary()
+        logger.info(
+            f"  [Scheduler] Phase {s['phase']} ({s['phase_name']}) | "
+            f"Win Rate: {s['rolling_win_rate']:.1%} | "
+            f"Avg Reward: {s['rolling_avg_reward']:+.2f} | "
+            f"Phase Episodes: {s['phase_episodes']}"
+        )
+
+        # --- Early-stop convergence check ----------------------------------
+        # Compute this group's mean reward + win rate (NOT the global
+        # rolling stats) so the convergence buffer captures recent
+        # behaviour. We only count groups that occurred while in a
+        # qualifying phase, so trivial Phase-1 spikes never trigger stop.
+        if early_stop and group_rewards:
+            group_mean = sum(group_rewards) / len(group_rewards)
+            group_win  = sum(1 for o in group_outcomes if o == "WIN") / len(group_outcomes)
+            convergence_buffer.append({
+                "phase":         s["phase"],
+                "group_mean":    group_mean,
+                "group_win":     group_win,
+                "rolling_avg":   s["rolling_avg_reward"],
+                "rolling_win":   s["rolling_win_rate"],
+            })
+            if (
+                len(convergence_buffer) >= convergence_window
+                and all(b["phase"] >= convergence_min_phase for b in convergence_buffer)
+                and all(b["rolling_avg"] >= target_rolling_reward for b in convergence_buffer)
+                and all(b["rolling_win"] >= target_win_rate     for b in convergence_buffer)
+            ):
+                converged = True
+                logger.info(
+                    f"\n{'*' * 60}\n"
+                    f"  EARLY STOP: convergence reached after {episode_idx} episodes\n"
+                    f"  Last {convergence_window} groups all met target:\n"
+                    f"    rolling_avg_reward >= {target_rolling_reward:+.2f}\n"
+                    f"    rolling_win_rate   >= {target_win_rate:.0%}\n"
+                    f"    in phase           >= {convergence_min_phase}\n"
+                    f"{'*' * 60}"
+                )
+                break
+
+            # Show a compact "progress toward convergence" line so the
+            # operator can see the early-stop watchdog working.
+            qualified = sum(
+                1 for b in convergence_buffer
+                if b["phase"] >= convergence_min_phase
+                and b["rolling_avg"] >= target_rolling_reward
+                and b["rolling_win"] >= target_win_rate
+            )
             logger.info(
-                f"  [Scheduler] Phase {s['phase']} ({s['phase_name']}) | "
-                f"Win Rate: {s['rolling_win_rate']:.1%} | "
-                f"Avg Reward: {s['rolling_avg_reward']:+.2f} | "
-                f"Phase Episodes: {s['phase_episodes']}"
+                f"  [EarlyStop] qualified {qualified}/{convergence_window} "
+                f"recent groups (need all {convergence_window})"
             )
 
-    # --- Final Save ---
+    # --- Final save: adapters + merged fp16 ---
     total_time = time.time() - start_time
     metrics_path = os.path.join(output_dir, "training_metrics.json")
     with open(metrics_path, "w") as f:
         json.dump(metrics_log, f, indent=2)
 
+    if not dry_run:
+        adapter_dir = os.path.join(output_dir, "final_lora")
+        merged_dir = os.path.join(output_dir, "final_merged_fp16")
+        try:
+            save_lora_adapters(model, tokenizer, adapter_dir)
+            merge_and_save_fp16(model, tokenizer, merged_dir)
+        except Exception as e:
+            logger.error(f"Final save failed: {e}")
+
+        # Smoke-test inference on the trained model so we catch broken
+        # save paths before the demo (§16 explicit warning).
+        try:
+            test_obs = (
+                '{"event":"episode_start","nurse_experience":"veteran",'
+                '"message":"You are an ER doctor.","soap_summary":{}}'
+            )
+            sample = generate_doctor_action(
+                model, tokenizer, test_obs, device=device, max_new_tokens=128
+            )
+            logger.info(f"  Post-training inference smoke test OK: {sample[:120]}")
+        except Exception as e:
+            logger.error(f"  Post-training inference smoke test FAILED: {e}")
+
     logger.info(f"\n{'=' * 60}")
     logger.info(f"  TRAINING COMPLETE")
-    logger.info(f"  Total episodes: {num_episodes}")
+    logger.info(f"  Total episodes: {episode_idx}")
     logger.info(f"  Total time: {total_time / 60:.1f} minutes")
     logger.info(f"  Final phase: {scheduler.current_phase.name}")
     logger.info(f"  Metrics: {metrics_path}")
@@ -600,6 +1013,9 @@ def train(
 
     if not dry_run:
         env.close()
+
+    if wandb_run:
+        wandb_run.finish()
 
     return metrics_log
 
@@ -612,14 +1028,31 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="ER-MAP GRPO Training with Curriculum")
-    parser.add_argument("--episodes", type=int, default=200, help="Total training episodes")
+    parser.add_argument("--episodes", type=int, default=200,
+                        help="Hard cap on total training episodes (early-stop may finish sooner)")
     parser.add_argument("--group-size", type=int, default=4, help="GRPO group size (G)")
-    parser.add_argument("--model", type=str, default="unsloth/Qwen3-4B", help="Base model")
+    parser.add_argument("--model", type=str,
+                        default="unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit",
+                        help="Base model (Llama-3.1-8B-Instruct-bnb-4bit by default)")
     parser.add_argument("--groq-key", type=str, default="", help="Groq API key")
     parser.add_argument("--lr", type=float, default=5e-6, help="Learning rate")
+    parser.add_argument("--kl-beta", type=float, default=0.04, help="KL coefficient")
     parser.add_argument("--wandb", action="store_true", help="Log to W&B")
-    parser.add_argument("--output-dir", type=str, default="./er_map_grpo_checkpoints", help="Output dir")
+    parser.add_argument("--output-dir", type=str,
+                        default="./er_map_grpo_checkpoints", help="Output dir")
     parser.add_argument("--dry-run", action="store_true", help="Test scheduler without model")
+
+    # Early-stopping knobs
+    parser.add_argument("--target-rolling-reward", type=float, default=1.5,
+                        help="Stop when rolling_avg_reward sustains >= this value")
+    parser.add_argument("--target-win-rate", type=float, default=0.40,
+                        help="Stop when rolling_win_rate sustains >= this value")
+    parser.add_argument("--convergence-window", type=int, default=5,
+                        help="How many consecutive GRPO groups must meet target")
+    parser.add_argument("--convergence-min-phase", type=int, default=3,
+                        help="Only count groups while curriculum phase >= this")
+    parser.add_argument("--no-early-stop", action="store_true",
+                        help="Disable early-stop (always run all configured episodes)")
 
     args = parser.parse_args()
 
@@ -629,7 +1062,13 @@ if __name__ == "__main__":
         model_name=args.model,
         groq_api_key=args.groq_key,
         learning_rate=args.lr,
+        kl_beta=args.kl_beta,
         use_wandb=args.wandb,
         output_dir=args.output_dir,
         dry_run=args.dry_run,
+        target_rolling_reward=args.target_rolling_reward,
+        target_win_rate=args.target_win_rate,
+        convergence_window=args.convergence_window,
+        convergence_min_phase=args.convergence_min_phase,
+        early_stop=not args.no_early_stop,
     )

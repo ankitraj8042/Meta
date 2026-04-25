@@ -15,7 +15,7 @@ env:
   action_space: "Text"
   observation_space: "Text"
 
-  max_episode_steps: 15
+  max_episode_steps: 20
 
   env_kwargs:
     groq_api_key: "${GROQ_API_KEY}"

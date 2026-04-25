@@ -211,6 +211,60 @@ def emotionalize_for_tts(text: str, voice_key: str, groq_client=None, model: str
         return _fallback_emotion_transform(text, voice_key)
 
 
+def _emotionalize_with_status(text, voice_key, groq_client, model):
+    """
+    LLM emotion rewrite that returns ``(rewritten_text, auth_failed)``.
+
+    Mirrors ``emotionalize_for_tts`` but does NOT swallow auth errors —
+    instead reports them to the caller so the TTS engine can disable the
+    LLM rewrite for the rest of the session and stop spamming 401s in the
+    terminal. Non-auth errors fall back silently to the regex transform.
+    """
+    if not text or len(text.strip()) < 5:
+        return text, False
+    persona_instruction = _PERSONA_INSTRUCTIONS.get(voice_key)
+    if not persona_instruction or groq_client is None:
+        return _fallback_emotion_transform(text, voice_key), False
+
+    prompt = (
+        f"{persona_instruction}\n\n"
+        f"ORIGINAL TEXT:\n\"{text}\"\n\n"
+        f"RULES:\n"
+        f"- Output ONLY the rewritten speech text. No quotes, no labels, no explanations.\n"
+        f"- Keep the medical content and meaning EXACTLY the same.\n"
+        f"- Only change HOW it is said, not WHAT is said.\n"
+        f"- Add ElevenLabs audio tags like [sigh], [gasps], [nervous], [calm], etc.\n"
+        f"- Use '...' for trailing off and '—' for sharp pauses.\n"
+        f"- Keep the output under {len(text) + 80} characters.\n"
+        f"- Make it sound like a REAL person talking, not a script."
+    )
+
+    try:
+        completion = groq_client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system",
+                 "content": "You rewrite clinical text into emotionally expressive natural speech for text-to-speech synthesis. Output ONLY the rewritten text."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.9,
+            max_tokens=256,
+        )
+        result = (completion.choices[0].message.content or "").strip()
+        if result.startswith('"') and result.endswith('"'):
+            result = result[1:-1]
+        if result and len(result) > 5:
+            return result, False
+        return _fallback_emotion_transform(text, voice_key), False
+    except Exception as e:
+        msg = str(e).lower()
+        auth = ("401" in msg or "invalid_api_key" in msg or "invalid api key" in msg
+                or "unauthorized" in msg)
+        if not auth:
+            logger.warning(f"LLM emotion adapter failed ({voice_key}): {e}")
+        return _fallback_emotion_transform(text, voice_key), auth
+
+
 def _fallback_emotion_transform(text: str, voice_key: str) -> str:
     """Simple regex-based fallback when LLM adapter is unavailable."""
     if voice_key == "patient_hostile_aggressive":
@@ -414,8 +468,15 @@ class TTSEngine:
         self._has_pygame = False
         self._groq_client = None
         self._groq_model = "llama-3.3-70b-versatile"
-        # Initialize ElevenLabs
-        if self.api_key:
+        # Operator override: ERMAP_DISABLE_ELEVENLABS=1 forces Edge-TTS only.
+        # Useful when the ElevenLabs free tier has been locked out by their
+        # abuse detector (status=detected_unusual_activity) — saves one
+        # failed API round-trip per audio chunk.
+        _disable_eleven = os.environ.get("ERMAP_DISABLE_ELEVENLABS", "").strip().lower() in {"1", "true", "yes"}
+
+        if _disable_eleven:
+            logger.info("TTS Engine: ElevenLabs DISABLED via ERMAP_DISABLE_ELEVENLABS")
+        elif self.api_key:
             try:
                 from elevenlabs.client import ElevenLabs
                 self._eleven_client = ElevenLabs(api_key=self.api_key)
@@ -427,8 +488,19 @@ class TTSEngine:
         if not self.use_elevenlabs:
             logger.info("TTS Engine: Edge-TTS (free fallback)")
 
-        # Initialize Groq client for LLM Emotion Adapter
-        _groq_key = groq_api_key or os.environ.get("GROQ_NURSE_API_KEY") or os.environ.get("GROQ_API_KEY", "")
+        # Initialize Groq client for LLM Emotion Adapter. Tries multiple
+        # keys in order so a dead nurse key doesn't kill emotion rewriting
+        # if one of the other Groq accounts is alive.
+        candidate_keys = [
+            groq_api_key,
+            os.environ.get("GROQ_NURSE_API_KEY"),
+            os.environ.get("GROQ_PATIENT_API_KEY"),
+            os.environ.get("GROQ_DOCTOR_API_KEY"),
+            os.environ.get("GROQ_EMPATHY_JUDGE_API_KEY"),
+            os.environ.get("GROQ_MEDICAL_JUDGE_API_KEY"),
+            os.environ.get("GROQ_API_KEY"),
+        ]
+        _groq_key = next((k for k in candidate_keys if k), "")
         if _groq_key:
             try:
                 from groq import Groq
@@ -438,6 +510,11 @@ class TTSEngine:
                 logger.warning("groq package not installed. Using regex emotion fallback.")
         else:
             logger.info("TTS Emotion Adapter: regex fallback (no GROQ key)")
+
+        # Once the emotion adapter hits an auth error we permanently
+        # disable it for the rest of the session — Edge-TTS doesn't need
+        # the LLM rewrite, and the failure was flooding the terminal.
+        self._emotion_adapter_dead = False
 
         # Initialize pygame for audio playback
         try:
@@ -473,9 +550,24 @@ class TTSEngine:
         voice_key = get_voice_key(agent, ground_truth)
 
         # Layer 1: LLM Emotion Adapter — rewrites clean text into
-        # emotionally expressive natural speech. Falls back to regex
-        # transforms if no Groq client is available.
-        text = emotionalize_for_tts(text, voice_key, self._groq_client, self._groq_model)
+        # emotionally expressive natural speech. Skipped entirely once
+        # the Groq client behind it has hit an auth error in this
+        # session (cleaner logs, no behavioural impact since regex
+        # fallback handles the rewrite). Returns boolean flag so we can
+        # mark the adapter dead on the first auth failure.
+        if self._emotion_adapter_dead:
+            text = _fallback_emotion_transform(text, voice_key)
+        else:
+            text, auth_failed = _emotionalize_with_status(
+                text, voice_key, self._groq_client, self._groq_model
+            )
+            if auth_failed:
+                self._emotion_adapter_dead = True
+                print(
+                    "  [TTS] emotion adapter auth failed — disabling LLM rewrite "
+                    "for the rest of this session (regex fallback active).",
+                    flush=True,
+                )
         logger.info(f"TTS [{voice_key}]: {text[:120]}")
 
         try:
@@ -492,20 +584,42 @@ class TTSEngine:
                     clean_for_edge = text
                 return self._generate_edge(clean_for_edge, voice_key)
         except Exception as e:
+            err_str = str(e)
             logger.error(f"TTS generation failed ({voice_key}): {e}")
             print(f"  [TTS ERROR] voice_key={voice_key} agent={agent}: {e}", flush=True)
-            # Fallback to Edge-TTS if ElevenLabs fails
+
+            # Auto-disable ElevenLabs for the rest of this session if the
+            # error indicates an unrecoverable account/auth/lockout state.
+            # This prevents repeating the same failed network round-trip on
+            # every subsequent TTS call.
             if self.use_elevenlabs:
-                try:
-                    print(f"  [TTS] Falling back to Edge-TTS for {agent}...", flush=True)
-                    # Strip any bracketed tags before sending to Edge-TTS
-                    import re as _re
-                    clean_for_edge = _re.sub(r'\[.*?\]', '', text).strip()
-                    if len(clean_for_edge) < 3:
-                        clean_for_edge = text  # safety fallback
-                    return self._generate_edge(clean_for_edge, voice_key)
-                except Exception as e2:
-                    logger.error(f"Edge-TTS fallback also failed: {e2}")
+                lower = err_str.lower()
+                if (
+                    "401" in err_str
+                    or "detected_unusual_activity" in lower
+                    or "free tier usage disabled" in lower
+                    or "invalid_api_key" in lower
+                    or "unauthorized" in lower
+                ):
+                    self.use_elevenlabs = False
+                    self._eleven_client = None
+                    print(
+                        "  [TTS] ElevenLabs locked out (auth/abuse-detector). "
+                        "Switching session to Edge-TTS only.",
+                        flush=True,
+                    )
+
+            # Fallback to Edge-TTS regardless (one-shot or permanent)
+            try:
+                print(f"  [TTS] Falling back to Edge-TTS for {agent}...", flush=True)
+                # Strip any bracketed tags before sending to Edge-TTS
+                import re as _re
+                clean_for_edge = _re.sub(r'\[.*?\]', '', text).strip()
+                if len(clean_for_edge) < 3:
+                    clean_for_edge = text  # safety fallback
+                return self._generate_edge(clean_for_edge, voice_key)
+            except Exception as e2:
+                logger.error(f"Edge-TTS fallback also failed: {e2}")
             return None
 
     def _generate_elevenlabs(self, text: str, voice_key: str) -> io.BytesIO:

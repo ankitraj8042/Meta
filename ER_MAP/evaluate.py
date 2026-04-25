@@ -14,7 +14,7 @@ import os
 import sys
 import time
 import argparse
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 # Force unbuffered output
 sys.stdout.reconfigure(line_buffering=True)
@@ -46,35 +46,150 @@ RESPOND ONLY WITH VALID JSON."""
 
 
 class DoctorBrain:
-    def __init__(self, api_key: str, model: str = "llama-3.3-70b-versatile"):
+    """
+    Resilient Doctor LLM client.
+
+    - Accepts a single key (legacy) OR a list of (api_key, model) tuples.
+    - On 401 (invalid key) or 429 (rate-limited), marks that
+      (key, model) pair as dead and silently advances to the next pair
+      so the episode keeps progressing instead of looping on stale data.
+    - When *every* pair is dead, falls back to a deterministic clinical
+      decision tree (`_smart_fallback_action`) that drives the episode
+      toward a sensible discharge instead of spamming "Update me on the
+      patient" 30 times and burning Nurse/Patient tokens.
+    """
+
+    def __init__(self, api_key: str = "", model: str = "llama-3.1-8b-instant",
+                 fallback_chain: Optional[List[Dict[str, str]]] = None):
         from groq import Groq
-        self.client = Groq(api_key=api_key)
-        self.model = model
+        self._Groq = Groq
+
+        # Build the (key, model) chain. The Doctor's *primary* model is
+        # 8B-Instant: it has its own daily TPD pool, separate from the
+        # 70B pool used by Nurse/Patient/Judges. Rotating across both
+        # pools effectively gives ~5x more headroom than a single key.
+        if fallback_chain is None:
+            fallback_chain = []
+            if api_key:
+                fallback_chain.append({"key": api_key, "model": model})
+        self._chain: List[Dict[str, Any]] = []
+        seen = set()
+        for entry in fallback_chain:
+            k = (entry["key"], entry["model"])
+            if not entry["key"] or k in seen:
+                continue
+            seen.add(k)
+            self._chain.append({
+                "key":   entry["key"],
+                "model": entry["model"],
+                "client": Groq(api_key=entry["key"]),
+                "dead":  False,
+                "label": entry.get("label", entry["key"][-4:]),
+            })
+        if not self._chain:
+            raise ValueError("DoctorBrain: empty fallback chain")
+
+        # Keep .client / .model for backward compat with any caller
+        # that still pokes at them (rare, but safer to expose).
+        self.client = self._chain[0]["client"]
+        self.model  = self._chain[0]["model"]
+
         self.history = [{"role": "system", "content": DOCTOR_SYSTEM_PROMPT}]
+        self._consecutive_failures = 0
 
     def reset(self):
         self.history = [{"role": "system", "content": DOCTOR_SYSTEM_PROMPT}]
+        self._consecutive_failures = 0
+
+    def _alive_clients(self) -> List[Dict[str, Any]]:
+        return [c for c in self._chain if not c["dead"]]
+
+    @staticmethod
+    def _is_dead_error(err: Exception) -> bool:
+        """Detect Groq 401 (invalid key) and 429 (rate-limited)."""
+        s = str(err)
+        return "401" in s or "429" in s or "rate_limit" in s.lower() \
+               or "invalid_api_key" in s.lower()
+
+    def _smart_fallback_action(self) -> str:
+        """
+        Deterministic clinical decision tree used when every Groq client
+        in the chain is dead. Drives the episode toward a sensible
+        terminal state instead of looping on "Give me an update".
+        """
+        depth = self._consecutive_failures
+        if depth <= 1:
+            action = {
+                "thought": "Fallback (no LLM available): start by reading the SOAP note",
+                "tool": "read_soap", "section": "ALL",
+            }
+        elif depth == 2:
+            action = {
+                "thought": "Fallback: ask nurse for vitals and a focused exam",
+                "tool": "speak_to", "target": "nurse",
+                "message": "Please get full vitals (HR/BP/RR/SpO2/Temp) and report any focal findings.",
+            }
+        elif depth == 3:
+            action = {
+                "thought": "Fallback: order a broad initial lab panel",
+                "tool": "order_lab", "target": "nurse",
+                "test_name": "CBC, BMP, lactate, troponin, ECG",
+            }
+        elif depth == 4:
+            action = {
+                "thought": "Fallback: document working assessment before discharge",
+                "tool": "update_soap", "section": "Assessment",
+                "content": "Working dx pending; treating empirically based on vitals + chief complaint.",
+            }
+        else:
+            # After 5+ consecutive failures, end the episode rather than
+            # waste any more Nurse/Patient tokens. Use a safe empirical
+            # treatment that covers the most common emergent diagnoses.
+            action = {
+                "thought": "Fallback: empirical discharge to terminate stuck episode",
+                "tool": "terminal_discharge",
+                "treatment": "Empirical: O2 + IV fluids + monitor; ICU admit if unstable.",
+            }
+        return json.dumps(action)
 
     def decide(self, observation: str) -> str:
         self.history.append({"role": "user", "content": f"Observation:\n{observation}"})
         if len(self.history) > 17:
             self.history = [self.history[0]] + self.history[-16:]
-        try:
-            completion = self.client.chat.completions.create(
-                model=self.model,
-                messages=self.history,
-                temperature=0.6,
-                max_tokens=300,
-                response_format={"type": "json_object"},
-            )
-            response = completion.choices[0].message.content or ""
-        except Exception as e:
-            print(f"      [Doctor API Error: {e}]", flush=True)
-            response = json.dumps({
-                "thought": "API error fallback",
-                "tool": "speak_to", "target": "nurse",
-                "message": "Give me an update on the patient"
-            })
+
+        response = None
+        for entry in self._alive_clients():
+            try:
+                completion = entry["client"].chat.completions.create(
+                    model=entry["model"],
+                    messages=self.history,
+                    temperature=0.6,
+                    max_tokens=300,
+                    response_format={"type": "json_object"},
+                )
+                response = completion.choices[0].message.content or ""
+                self._consecutive_failures = 0
+                break
+            except Exception as e:
+                if self._is_dead_error(e):
+                    print(f"      [Doctor: key=...{entry['label']} "
+                          f"model={entry['model']} -> DEAD ({type(e).__name__}); "
+                          f"trying next]", flush=True)
+                    entry["dead"] = True
+                    continue
+                # Non-fatal error (network blip, JSON parse, etc.) — give
+                # up on this turn but DON'T mark the key dead.
+                print(f"      [Doctor API Error: {e}]", flush=True)
+                break
+
+        if response is None:
+            self._consecutive_failures += 1
+            alive = len(self._alive_clients())
+            print(f"      [Doctor: all {len(self._chain)} clients dead "
+                  f"({alive} alive). Smart fallback depth={self._consecutive_failures}]",
+                  flush=True)
+            response = self._smart_fallback_action()
+
         self.history.append({"role": "assistant", "content": response})
         return response
 
