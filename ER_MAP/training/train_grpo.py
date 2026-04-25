@@ -172,6 +172,21 @@ class CurriculumScheduler:
             f"{'*' * 60}"
         )
 
+    def force_promote(self, reason: str = "external trigger") -> bool:
+        """Externally force advancing to the next phase.
+
+        Used by the per-phase reward-threshold early-stop in the training
+        loop: when the policy sustains the configured reward target for
+        the current phase, we advance immediately (in parallel to the
+        built-in win-rate-based promotion in `record_episode`). Returns
+        True if a promotion happened, False if already in the final phase.
+        """
+        if self.current_phase_idx >= len(self.PHASES) - 1:
+            return False
+        logger.info(f"  [Scheduler] force_promote() called: {reason}")
+        self._promote()
+        return True
+
     def get_env_options(self) -> Dict[str, Any]:
         return {
             "phase": self.phase_id,
@@ -655,17 +670,25 @@ def train(
     dry_run: bool = False,
     *,
     # ---------------- Early-stopping ("train until optimal") ---------------
-    # Stop training as soon as the policy sustains BOTH:
-    #   rolling_avg_reward >= target_rolling_reward
-    #   rolling_win_rate   >= target_win_rate
-    # for `convergence_window` consecutive GRPO groups, while in phase
-    # `convergence_min_phase` or above. `num_episodes` becomes a HARD CAP.
-    target_rolling_reward: float = 1.5,
-    target_win_rate: float = 0.40,
-    convergence_window: int = 5,
-    convergence_min_phase: int = 3,
+    # Per-phase reward thresholds. After every GRPO update we look at the
+    # last `convergence_window` groups; if ALL of them belong to the same
+    # current phase AND have rolling_avg_reward >= phase_reward_targets
+    # [current_phase], we either:
+    #   - force-promote to the next phase (Phase 1 / 2), OR
+    #   - terminate training (Phase 3).
+    # `num_episodes` becomes a HARD CAP, not a budget.
+    #
+    # Default mapping mirrors the user-tunable bar:
+    #   Phase 1 (Tool Mastery)         : sustained rolling avg >= 1.5
+    #   Phase 2 (Clinical Reasoning)   : sustained rolling avg >= 1.2
+    #   Phase 3 (Empathetic Negotiation): sustained rolling avg >= 1.0
+    phase_reward_targets: Optional[Dict[int, float]] = None,
+    phase_min_win_rate: float = 0.20,
+    convergence_window: int = 3,
     early_stop: bool = True,
 ):
+    if phase_reward_targets is None:
+        phase_reward_targets = {1: 1.5, 2: 1.2, 3: 1.0}
     """
     Main GRPO training loop with curriculum scheduling.
 
@@ -737,10 +760,14 @@ def train(
                 f"(={num_episodes // group_size} GRPO updates)")
     if early_stop:
         logger.info(
-            f"  Early-stop ON: target rolling-avg-reward >= {target_rolling_reward:+.2f} "
-            f"AND win-rate >= {target_win_rate:.0%} sustained for "
-            f"{convergence_window} groups in phase >= {convergence_min_phase}"
+            f"  Early-stop ON: per-phase reward thresholds (sustained for "
+            f"{convergence_window} groups, win-rate >= {phase_min_win_rate:.0%}):"
         )
+        for _pid in sorted(phase_reward_targets.keys()):
+            _action = "END TRAINING" if _pid == 3 else "force-promote to next phase"
+            logger.info(
+                f"    Phase {_pid}: avg-reward >= {phase_reward_targets[_pid]:+.2f} -> {_action}"
+            )
     else:
         logger.info("  Early-stop OFF: will run all configured episodes.")
 
@@ -928,51 +955,67 @@ def train(
             f"Phase Episodes: {s['phase_episodes']}"
         )
 
-        # --- Early-stop convergence check ----------------------------------
-        # Compute this group's mean reward + win rate (NOT the global
-        # rolling stats) so the convergence buffer captures recent
-        # behaviour. We only count groups that occurred while in a
-        # qualifying phase, so trivial Phase-1 spikes never trigger stop.
+        # --- Per-phase early-stop / promotion check ------------------------
+        # Maintain a buffer of the last `convergence_window` GRPO groups
+        # with their (phase, rolling_avg, rolling_win). When ALL N entries
+        # share the SAME current_phase and meet that phase's reward bar
+        # (and the soft win-rate floor), we either force-promote (Phase 1
+        # / Phase 2) or terminate training (Phase 3).
         if early_stop and group_rewards:
-            group_mean = sum(group_rewards) / len(group_rewards)
-            group_win  = sum(1 for o in group_outcomes if o == "WIN") / len(group_outcomes)
             convergence_buffer.append({
-                "phase":         s["phase"],
-                "group_mean":    group_mean,
-                "group_win":     group_win,
-                "rolling_avg":   s["rolling_avg_reward"],
-                "rolling_win":   s["rolling_win_rate"],
+                "phase":       s["phase"],
+                "rolling_avg": s["rolling_avg_reward"],
+                "rolling_win": s["rolling_win_rate"],
             })
-            if (
-                len(convergence_buffer) >= convergence_window
-                and all(b["phase"] >= convergence_min_phase for b in convergence_buffer)
-                and all(b["rolling_avg"] >= target_rolling_reward for b in convergence_buffer)
-                and all(b["rolling_win"] >= target_win_rate     for b in convergence_buffer)
-            ):
-                converged = True
-                logger.info(
-                    f"\n{'*' * 60}\n"
-                    f"  EARLY STOP: convergence reached after {episode_idx} episodes\n"
-                    f"  Last {convergence_window} groups all met target:\n"
-                    f"    rolling_avg_reward >= {target_rolling_reward:+.2f}\n"
-                    f"    rolling_win_rate   >= {target_win_rate:.0%}\n"
-                    f"    in phase           >= {convergence_min_phase}\n"
-                    f"{'*' * 60}"
-                )
-                break
+            current_phase = s["phase"]
+            phase_target = phase_reward_targets.get(current_phase, float("inf"))
 
-            # Show a compact "progress toward convergence" line so the
-            # operator can see the early-stop watchdog working.
-            qualified = sum(
-                1 for b in convergence_buffer
-                if b["phase"] >= convergence_min_phase
-                and b["rolling_avg"] >= target_rolling_reward
-                and b["rolling_win"] >= target_win_rate
-            )
-            logger.info(
-                f"  [EarlyStop] qualified {qualified}/{convergence_window} "
-                f"recent groups (need all {convergence_window})"
-            )
+            buffer_full = len(convergence_buffer) >= convergence_window
+            same_phase = buffer_full and all(b["phase"] == current_phase for b in convergence_buffer)
+            reward_met = buffer_full and all(b["rolling_avg"] >= phase_target for b in convergence_buffer)
+            winrate_met = buffer_full and all(b["rolling_win"] >= phase_min_win_rate for b in convergence_buffer)
+
+            if buffer_full and same_phase and reward_met and winrate_met:
+                if current_phase >= 3:
+                    converged = True
+                    logger.info(
+                        f"\n{'*' * 60}\n"
+                        f"  EARLY STOP: Phase {current_phase} convergence reached after "
+                        f"{episode_idx} episodes\n"
+                        f"  Last {convergence_window} groups all sustained:\n"
+                        f"    rolling_avg_reward >= {phase_target:+.2f}\n"
+                        f"    rolling_win_rate   >= {phase_min_win_rate:.0%}\n"
+                        f"  in Phase {current_phase} ({s['phase_name']})\n"
+                        f"{'*' * 60}"
+                    )
+                    break
+                else:
+                    promoted = scheduler.force_promote(
+                        reason=(
+                            f"sustained rolling-avg-reward {phase_target:+.2f} for "
+                            f"{convergence_window} consecutive groups in Phase {current_phase}"
+                        )
+                    )
+                    if promoted:
+                        # Reset the buffer so the new phase starts fresh —
+                        # we don't want stale Phase-N entries to satisfy
+                        # the Phase-(N+1) check.
+                        convergence_buffer.clear()
+            else:
+                # Show a compact "progress toward this phase's target" line
+                # so the operator can see the watchdog working.
+                qualified = sum(
+                    1 for b in convergence_buffer
+                    if b["phase"] == current_phase
+                    and b["rolling_avg"] >= phase_target
+                    and b["rolling_win"] >= phase_min_win_rate
+                )
+                action = "END TRAINING" if current_phase >= 3 else "promote"
+                logger.info(
+                    f"  [EarlyStop] Phase {current_phase} target avg-reward "
+                    f">= {phase_target:+.2f}: qualified {qualified}/{convergence_window} "
+                    f"recent groups (need all {convergence_window} -> {action})"
+                )
 
     # --- Final save: adapters + merged fp16 ---
     total_time = time.time() - start_time
@@ -1042,15 +1085,17 @@ if __name__ == "__main__":
                         default="./er_map_grpo_checkpoints", help="Output dir")
     parser.add_argument("--dry-run", action="store_true", help="Test scheduler without model")
 
-    # Early-stopping knobs
-    parser.add_argument("--target-rolling-reward", type=float, default=1.5,
-                        help="Stop when rolling_avg_reward sustains >= this value")
-    parser.add_argument("--target-win-rate", type=float, default=0.40,
-                        help="Stop when rolling_win_rate sustains >= this value")
-    parser.add_argument("--convergence-window", type=int, default=5,
-                        help="How many consecutive GRPO groups must meet target")
-    parser.add_argument("--convergence-min-phase", type=int, default=3,
-                        help="Only count groups while curriculum phase >= this")
+    # Early-stopping knobs (per-phase reward targets)
+    parser.add_argument("--phase1-target", type=float, default=1.5,
+                        help="Phase 1 sustained rolling-avg-reward bar (force-promote when met)")
+    parser.add_argument("--phase2-target", type=float, default=1.2,
+                        help="Phase 2 sustained rolling-avg-reward bar (force-promote when met)")
+    parser.add_argument("--phase3-target", type=float, default=1.0,
+                        help="Phase 3 sustained rolling-avg-reward bar (END TRAINING when met)")
+    parser.add_argument("--phase-min-win-rate", type=float, default=0.20,
+                        help="Soft floor on rolling win rate (sanity check, default 20%)")
+    parser.add_argument("--convergence-window", type=int, default=3,
+                        help="How many consecutive GRPO groups must meet target (default 3)")
     parser.add_argument("--no-early-stop", action="store_true",
                         help="Disable early-stop (always run all configured episodes)")
 
@@ -1066,9 +1111,12 @@ if __name__ == "__main__":
         use_wandb=args.wandb,
         output_dir=args.output_dir,
         dry_run=args.dry_run,
-        target_rolling_reward=args.target_rolling_reward,
-        target_win_rate=args.target_win_rate,
+        phase_reward_targets={
+            1: args.phase1_target,
+            2: args.phase2_target,
+            3: args.phase3_target,
+        },
+        phase_min_win_rate=args.phase_min_win_rate,
         convergence_window=args.convergence_window,
-        convergence_min_phase=args.convergence_min_phase,
         early_stop=not args.no_early_stop,
     )

@@ -16,7 +16,7 @@ This guide walks you through training the ER-MAP **Doctor agent** with GRPO + 3-
 7. Edit the two URLs in cell 2 (`GIT_URL`) and cell 5 (`HF_PUSH_REPO`) to your fork / username.
 8. **Run All**.
 
-Training **stops automatically** as soon as the Doctor sustains target reward + win rate for 5 consecutive GRPO groups in Phase 3 (this is the "train until optimal rewards are constantly received" guarantee — see the *Train-until-optimal* section below). `NUM_EPISODES=120` is just a hard cap; on a healthy run you typically converge between episodes 60-100.
+Training **stops automatically** the instant the Doctor sustains a phase-specific reward bar for **3 consecutive GRPO groups** — `+1.5` in Phase 1 (force-promote), `+1.2` in Phase 2 (force-promote), `+1.0` in Phase 3 (END). This is the "train until optimal rewards are constantly received" guarantee — see the *Train-until-optimal* section below. `NUM_EPISODES=120` is just a hard cap; healthy runs converge between episodes 70-130 (~6-11 h on T4 ×2).
 
 You'll see one full 6-panel dashboard PNG **per curriculum phase** land in `/kaggle/working/er_map_grpo_checkpoints/plots/` after training finishes (`phase1_dashboard.png`, `phase2_dashboard.png`, `phase3_dashboard.png`, plus `all_phases_overview.png` and `all_phases_comparison.png`), and your final LoRA adapter will be sitting on Hugging Face Hub at `<you>/ermap-doctor-lora`.
 
@@ -146,66 +146,101 @@ If the curve is flat or trending down:
 
 ---
 
-## Train-until-optimal — the early-stopping policy
+## Train-until-optimal — per-phase reward thresholds
 
 > *"I want training until certain optimal rewards are constantly received."*
 
-The training loop tracks a **rolling buffer of the last `CONVERGENCE_WINDOW` GRPO groups** and stops the run the instant **all** of them satisfy:
+After every GRPO update the loop maintains a **rolling buffer of the last `CONVERGENCE_WINDOW=3` groups**. When all 3 entries are in the *same* current phase AND each has `rolling_avg_reward >= PHASE_REWARD_TARGETS[current_phase]`, the loop reacts:
 
-- `rolling_avg_reward >= TARGET_ROLLING_REWARD`
-- `rolling_win_rate   >= TARGET_WIN_RATE`
-- the curriculum scheduler is in **phase ≥ `CONVERGENCE_MIN_PHASE`**
+| Current phase | When buffer qualifies | Effect |
+|---|---|---|
+| Phase 1 (Tool Mastery) | sustained `+1.5` for 3 groups | force-promote to Phase 2, clear buffer |
+| Phase 2 (Clinical Reasoning) | sustained `+1.2` for 3 groups | force-promote to Phase 3, clear buffer |
+| Phase 3 (Empathetic Negotiation) | sustained `+1.0` for 3 groups | **END TRAINING** |
+
+The buffer is cleared after each promotion so stale entries cannot pre-satisfy the next phase's bar. A soft `PHASE_MIN_WIN_RATE=0.20` floor prevents stopping on partial-credit-only runs.
 
 If even one group in the window slips below the bar, the counter resets — guaranteeing the policy is *constantly* hitting the target, not transiently. `NUM_EPISODES` becomes a hard safety cap, not a fixed budget.
 
-### Default targets (in the notebook, section 5)
+### Why the targets descend from `1.5` → `1.2` → `1.0`
+
+The phases are not equally easy to score on. Looking at the reward function:
+
+| Phase | Best-case reward (clean win) | Realistic clean-policy mean |
+|---|---|---|
+| 1 — easy patient, clean SOAP | `+2.0` (full terminal_win) | `+1.6 .. +1.8` |
+| 2 — mixed compliance + noisy SOAP | `+1.7` (terminal_win - some lab noise) | `+1.2 .. +1.4` |
+| 3 — full persona randomization + consent costs | `+1.4` (terminal_win - empathy/AMA penalties) | `+1.0 .. +1.2` |
+
+So requiring `+1.5` in Phase 1 demonstrates real tool mastery (not just floor-grazing), while requiring `+1.0` in Phase 3 is genuinely hard — no random policy ever sustains it.
+
+### Defaults (in the notebook, section 5)
 
 ```python
-EARLY_STOP_ENABLED      = True
-TARGET_ROLLING_REWARD   = 1.5    # +1.5 average reward, sustained
-TARGET_WIN_RATE         = 0.40   # 40% wins, sustained
-CONVERGENCE_WINDOW      = 5      # for 5 consecutive GRPO groups (= 10 episodes at G=2)
-CONVERGENCE_MIN_PHASE   = 3      # only count Phase-3 (Empathetic Negotiation) groups
+EARLY_STOP_ENABLED   = True
+PHASE_REWARD_TARGETS = {1: 1.5, 2: 1.2, 3: 1.0}
+PHASE_MIN_WIN_RATE   = 0.20  # soft floor
+CONVERGENCE_WINDOW   = 3
 ```
 
-### Reading the early-stop telemetry
+### Reading the per-phase telemetry
 
 After every GRPO group the log prints:
 
 ```
-[Scheduler] Phase 3 (Empathetic Negotiation) | Win Rate: 42.0% | Avg Reward: +1.62 | Phase Episodes: 24
-[EarlyStop] qualified 4/5 recent groups (need all 5)
+[Scheduler] Phase 2 (Clinical Reasoning) | Win Rate: 42.0% | Avg Reward: +1.18 | Phase Episodes: 14
+[EarlyStop] Phase 2 target avg-reward >= +1.20: qualified 2/3 recent groups (need all 3 -> promote)
 ```
 
-When the buffer is full and every entry qualifies, you'll see:
+When the Phase-2 buffer fills with 3 qualifying groups:
+
+```
+[Scheduler] force_promote() called: sustained rolling-avg-reward +1.20 for 3 consecutive groups in Phase 2
+************************************************************
+  CURRICULUM PROMOTION: Clinical Reasoning -> Empathetic Negotiation
+************************************************************
+```
+
+When Phase 3 finally converges:
 
 ```
 ************************************************************
-  EARLY STOP: convergence reached after 84 episodes
-  Last 5 groups all met target:
-    rolling_avg_reward >= +1.50
-    rolling_win_rate   >= 40%
-    in phase           >= 3
+  EARLY STOP: Phase 3 convergence reached after 92 episodes
+  Last 3 groups all sustained:
+    rolling_avg_reward >= +1.00
+    rolling_win_rate   >= 20%
+  in Phase 3 (Empathetic Negotiation)
 ************************************************************
 ```
 
 …and the loop exits cleanly into the final-save / final-push / plotting cells.
 
+### Per-phase wall-clock estimates on Kaggle T4 ×2
+
+| Phase | Typical episodes to hit target | Wall-clock | Why |
+|---|---|---|---|
+| 1 | 16 – 30 episodes (8 – 15 groups) | **~1.5 – 2.5 h** | Easy patients + clean SOAP; tool format is the only real lift. |
+| 2 | 24 – 40 episodes (12 – 20 groups) | **~2.0 – 3.5 h** | Most policy improvement happens here. |
+| 3 | 30 – 60 episodes (15 – 30 groups) | **~2.5 – 5.0 h** | Empathy + consent costs make `+1.0` genuinely hard. |
+| **Total** | 70 – 130 episodes | **~6 – 11 h** | Fits the 12 h GPU session with ~1 h margin. |
+
+Per-group wall-clock ≈ 8 – 12 min on T4 (depending on episode length); per-episode ≈ 3 – 5 min for env rollout + ≈ 1 – 2 min amortized for the GRPO update.
+
 ### Tuning suggestions
 
 | Goal | What to change |
 |---|---|
-| Smoke run (converge fast on a weak policy) | `TARGET_ROLLING_REWARD=0.5`, `TARGET_WIN_RATE=0.20`, `CONVERGENCE_MIN_PHASE=2` |
+| Smoke run (converge fast on a weak policy) | `PHASE_REWARD_TARGETS={1: 0.5, 2: 0.4, 3: 0.3}`, `CONVERGENCE_WINDOW=2` |
 | Hackathon-grade Doctor | keep defaults |
-| Aim for SOTA on this benchmark | `TARGET_ROLLING_REWARD=2.0`, `TARGET_WIN_RATE=0.55`, `CONVERGENCE_WINDOW=8` |
+| Aim for SOTA on this benchmark | `PHASE_REWARD_TARGETS={1: 1.7, 2: 1.5, 3: 1.3}`, `CONVERGENCE_WINDOW=5` |
 | Disable entirely (run full 120 episodes regardless) | `EARLY_STOP_ENABLED=False` |
-| Resuming from a partial run | targets are unchanged — the scheduler's rolling window is rebuilt from the new session's episodes, so nothing weird happens |
+| Resuming from a partial run | targets are unchanged — the buffer is rebuilt from the new session's groups, so nothing weird happens |
 
 ### What NOT to do
 
-- Don't set `CONVERGENCE_MIN_PHASE=1`. The scheduler promotes out of Phase 1 with a 50% win-rate trigger, so the win-rate condition is trivially satisfied by easy cases — you'd stop training before the model has even seen Phase-3 difficulty.
-- Don't set `CONVERGENCE_WINDOW=1`. A single lucky group can pass the bar even on a weak policy. 5 groups (= 10 episodes at G=2) is the smallest window that's stable.
-- Don't lower `TARGET_WIN_RATE` to 0 while keeping `CONVERGENCE_MIN_PHASE=3`. The "minimum phase" check needs the policy to first survive Phase 2's promotion bar (60% rolling win), so the floor is already implicit.
+- Don't set `CONVERGENCE_WINDOW=1`. A single lucky group can pass any bar; you'll promote out of Phase 1 the instant the first easy patient is correctly discharged.
+- Don't lower the Phase-1 target below `+0.8`. The built-in scheduler already promotes Phase 1 → Phase 2 at `win_rate >= 40% AND avg_reward >= +0.3`, so a Phase-1 reward bar below that is dead code.
+- Don't raise the Phase-3 target above `+1.5`. The reward ceiling on a Phase-3 episode (after empathy/consent costs) is around `+1.4 .. +1.6`; sustaining `+1.5+` for 3 consecutive groups is essentially unachievable in 12 h.
 
 ---
 
