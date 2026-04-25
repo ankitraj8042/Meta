@@ -242,6 +242,62 @@ class AgentRouter:
 
         return parsed
 
+    # ----- LLM-as-a-Judge Empathy Evaluation -----
+
+    def evaluate_empathy(self, message: str) -> dict:
+        """
+        Use a 70B LLM to grade the Doctor's empathy and communication style.
+        Returns dict with scores 0.0-1.0 for: empathy, explanation, dismissive, acknowledgment.
+
+        Routing: prefers the **patient** client so the Empathy Judge lives on
+        the same API key as the Doctor (Key A), leaving the Medical Judge
+        on the Nurse client (Key B) — which keeps both rate-limit budgets
+        independent.
+        """
+        client = self._clients.get("patient") or self._clients.get("nurse")
+        default_scores = {"empathy": 0.0, "explanation": 0.0, "dismissive": 0.0, "acknowledgment": 0.0}
+        
+        if client is None or not message:
+            return default_scores
+
+        judge_prompt = (
+            "Analyze the following message from a Doctor to a patient/nurse.\n"
+            f"Message: \"{message}\"\n\n"
+            "Grade the message on a scale of 0.0 to 1.0 for each of these four intents:\n"
+            "- empathy: Shows understanding, concern, reassurance, compassion.\n"
+            "- explanation: Educates the patient, explains reasoning, outlines plans.\n"
+            "- acknowledgment: Actively listens, asks clarifying questions, says 'I see' or 'tell me more'.\n"
+            "- dismissive: Curt, ignores concerns, rude, rushing, invalidating.\n\n"
+            "Respond ONLY in valid JSON format:\n"
+            '{"empathy": <float>, "explanation": <float>, "acknowledgment": <float>, "dismissive": <float>}'
+        )
+
+        try:
+            completion = client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "You are a communication analysis AI. Output ONLY valid JSON."},
+                    {"role": "user", "content": judge_prompt},
+                ],
+                temperature=0.1,
+                max_tokens=128,
+                response_format={"type": "json_object"},
+            )
+            raw_text = completion.choices[0].message.content or ""
+            parsed = _extract_json_from_text(raw_text)
+
+            if parsed:
+                return {
+                    "empathy": max(0.0, min(1.0, float(parsed.get("empathy", 0.0)))),
+                    "explanation": max(0.0, min(1.0, float(parsed.get("explanation", 0.0)))),
+                    "acknowledgment": max(0.0, min(1.0, float(parsed.get("acknowledgment", 0.0)))),
+                    "dismissive": max(0.0, min(1.0, float(parsed.get("dismissive", 0.0)))),
+                }
+            return default_scores
+        except Exception as e:
+            logger.error(f"Empathy Judge API error: {e}")
+            return default_scores
+
     # ----- LLM-as-a-Judge Treatment Evaluation -----
 
     def evaluate_treatment(
@@ -258,7 +314,9 @@ class AgentRouter:
         Returns:
             {"score": float 0.0-1.0, "is_lethal": bool, "reasoning": str}
         """
-        # Pick any available client (prefer nurse client to spread rate limits)
+        # Treatment / Medical Judge: prefers nurse client → lives on Key B.
+        # Empathy Judge prefers patient client → lives on Key A. This keeps
+        # the two judges on independent API key buckets.
         client = self._clients.get("nurse") or self._clients.get("patient")
         if client is None:
             logger.warning("No API client available for LLM Judge. Returning default score.")

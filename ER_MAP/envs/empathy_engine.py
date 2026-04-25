@@ -15,80 +15,6 @@ import random
 from typing import Dict, Tuple, Optional
 
 # ---------------------------------------------------------------------------
-# Intent Classification (heuristic, no LLM call needed)
-# ---------------------------------------------------------------------------
-
-# Empathetic phrases -- Doctor shows understanding, concern, reassurance
-EMPATHY_PATTERNS = [
-    r"\bi understand\b", r"\bi hear you\b", r"\bthat must be\b",
-    r"\bi can see\b", r"\bi know this is\b", r"\byou.?re doing great\b",
-    r"\bdon.?t worry\b", r"\bwe.?re going to\b", r"\bwe.?ll take care\b",
-    r"\bi.?m here\b", r"\byou.?re safe\b", r"\btake your time\b",
-    r"\bthat sounds\b.*\b(scary|difficult|painful|frightening)\b",
-    r"\bi.?m sorry\b.*\b(going through|dealing|feeling|hear)\b",
-    r"\bhow are you feeling\b", r"\bare you comfortable\b",
-    r"\blet me help\b", r"\bwe.?ll work together\b",
-    r"\bthat.?s understandable\b", r"\bit.?s okay\b",
-    r"\bi want to make sure\b.*\b(comfortable|safe|okay)\b",
-    r"\bthank you for\b.*\b(telling|sharing|trusting|coming)\b",
-]
-
-# Explanatory phrases -- Doctor educates, explains reasoning
-EXPLAIN_PATTERNS = [
-    r"\blet me explain\b", r"\bwhat this means\b", r"\bthe reason\b",
-    r"\bbecause\b.*\bneed\b", r"\bthis test will\b", r"\bthis helps us\b",
-    r"\bwhat we.?re doing\b", r"\bhere.?s (the|my) plan\b",
-    r"\bthe results show\b", r"\bbased on\b.*\bfindings\b",
-    r"\bi recommend\b.*\bbecause\b", r"\bthis is important because\b",
-    r"\bto rule out\b", r"\bto make sure\b", r"\bso we can\b",
-    r"\bthink of it as\b", r"\bin simple terms\b",
-]
-
-# Dismissive phrases -- Doctor is curt, ignores patient concerns
-DISMISSIVE_PATTERNS = [
-    r"\bjust do\b", r"\bjust take\b", r"\bjust calm\b",
-    r"\bthat.?s not important\b", r"\bdoesn.?t matter\b",
-    r"\bi don.?t have time\b", r"\bwe.?re busy\b",
-    r"\bjust sign\b", r"\bjust let me\b.*\bjob\b",
-    r"\bstop (complaining|worrying|asking)\b",
-    r"\byou.?re fine\b", r"\bit.?s nothing\b",
-    r"\bnext patient\b", r"\bhurry up\b",
-]
-
-# Acknowledgment phrases -- Doctor actively listens
-ACKNOWLEDGE_PATTERNS = [
-    r"\bi see\b", r"\bgo on\b", r"\btell me more\b",
-    r"\bwhat else\b", r"\band then\b", r"\bwhen did\b",
-    r"\bhow long\b", r"\bcan you describe\b",
-    r"\bwhat happened\b", r"\bwalk me through\b",
-]
-
-
-def classify_intent(message: str) -> Dict[str, float]:
-    """
-    Classify a Doctor message into intent scores.
-    Returns dict with scores for: empathy, explanation, dismissive, acknowledgment.
-    All scores are 0.0-1.0. Multiple intents can co-occur.
-    """
-    msg_lower = message.lower()
-    
-    def _score(patterns):
-        hits = sum(1 for p in patterns if re.search(p, msg_lower))
-        # Normalize: 1 match = 0.5, 2+ = 0.8, 3+ = 1.0
-        if hits == 0: return 0.0
-        if hits == 1: return 0.5
-        if hits == 2: return 0.8
-        return 1.0
-    
-    return {
-        "empathy": _score(EMPATHY_PATTERNS),
-        "explanation": _score(EXPLAIN_PATTERNS),
-        "dismissive": _score(DISMISSIVE_PATTERNS),
-        "acknowledgment": _score(ACKNOWLEDGE_PATTERNS),
-    }
-
-
-# ---------------------------------------------------------------------------
 # Patient Trust / Anxiety State Model
 # ---------------------------------------------------------------------------
 
@@ -251,22 +177,23 @@ def compute_empathy_reward(
             reward += 0.02 * intent["explanation"]
     
     if phase >= 3:
-        # Phase 3: Full empathy reward chain
+        # Phase 3: Full empathy reward chain (magnitudes softened slightly;
+        # the env-level per-episode cap is what really blocks farming).
         emp = intent.get("empathy", 0)
         dismiss = intent.get("dismissive", 0)
-        
+
         if emp > 0:
-            reward += 0.05 * emp
+            reward += 0.04 * emp        # was 0.05
         if dismiss > 0:
-            reward -= 0.08 * dismiss
-        
+            reward -= 0.06 * dismiss    # was 0.08
+
         # Bonus for maintaining high trust
         if patient_state.trust > 70:
             reward += 0.02
         # Penalty for critically low trust
         if patient_state.trust < 25:
             reward -= 0.03
-    
+
     return reward
 
 

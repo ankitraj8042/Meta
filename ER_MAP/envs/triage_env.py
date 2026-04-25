@@ -8,6 +8,7 @@ internal environment actors driven by LLMs via the AgentRouter.
 
 import json
 import logging
+import random
 import re
 from typing import Any, Dict, Optional, Tuple
 
@@ -22,7 +23,6 @@ from .randomizer import (
     SOAP_HISTORY_DB,
 )
 from .empathy_engine import (
-    classify_intent,
     compute_empathy_reward,
     PatientState,
     MilestoneTracker,
@@ -43,6 +43,53 @@ PATIENT_TOOLS = {"speak_to", "leave_hospital"}
 # ---------------------------------------------------------------------------
 MAX_INTERNAL_EXCHANGES = 3   # per Doctor step, Nurse ↔ Patient loop cap
 MAX_EPISODE_STEPS = 30       # total Doctor turns before truncation
+
+# ---------------------------------------------------------------------------
+# Per-episode reward caps (anti-farming; keeps process signal balanced
+# against terminal signal so the model cannot learn to spam empathy or
+# milestones to mask a wrong diagnosis).
+# ---------------------------------------------------------------------------
+EMPATHY_REWARD_CAP_POS = 0.30   # max positive empathy reward per episode
+EMPATHY_REWARD_CAP_NEG = -0.40  # max negative empathy reward per episode
+
+# ---------------------------------------------------------------------------
+# Stop-words used by the cheap process-level keyword verifier (intermediate
+# diagnosis bonus + terminal keyword overlap).
+# ---------------------------------------------------------------------------
+_VERIFIER_STOP_WORDS = {
+    "for", "if", "or", "and", "with", "to", "of", "the", "a", "an", "in",
+    "on", "at", "by", "from", "unable", "po", "signs", "is", "are", "then",
+    "above", "below", "due", "via", "per", "as", "be", "no", "not", "any",
+    "some", "this", "that", "these", "those", "patient", "patients",
+}
+
+
+def _keyword_set(text: str) -> set:
+    """Lowercase tokenize and drop stop words."""
+    if not text:
+        return set()
+    tokens = re.findall(r"[a-zA-Z]{3,}", text.lower())
+    return {t for t in tokens if t not in _VERIFIER_STOP_WORDS}
+
+
+def _fuzzy_overlap(target_kw: set, candidate_kw: set) -> float:
+    """
+    Substring-aware overlap ratio in [0, 1].
+    Uses both exact and substring matches (>=4 chars) so that
+    'thrombolytic' counts against 'thrombolytics'.
+    """
+    if not target_kw:
+        return 0.0
+    matched = set()
+    for t in target_kw:
+        if t in candidate_kw:
+            matched.add(t)
+            continue
+        for c in candidate_kw:
+            if len(t) >= 4 and (t in c or c in t):
+                matched.add(t)
+                break
+    return len(matched) / max(len(target_kw), 1)
 
 
 class TriageEnv(gym.Env):
@@ -103,6 +150,11 @@ class TriageEnv(gym.Env):
         self.patient_state: Optional[PatientState] = None
         self.milestone_tracker: Optional[MilestoneTracker] = None
 
+        # Per-episode reward bookkeeping (filled in reset())
+        self.reward_components: Dict[str, float] = {}
+        self.intermediate_diagnosis_awarded: bool = False
+        self.intermediate_plan_awarded: bool = False
+
     # ==================================================================
     # reset()
     # ==================================================================
@@ -115,8 +167,15 @@ class TriageEnv(gym.Env):
         - Generate ground truth (disease + persona traits).
         - Initialize Nurse/Patient LLMs with system prompts.
         - Return the Doctor's initial observation (only sees Nurse experience).
+
+        If `seed` is provided, the global `random` module is also seeded so
+        that scenario generation (which uses `random.choice`) is deterministic.
+        This is required for GRPO group rollouts where G completions must
+        share the same scenario.
         """
         super().reset(seed=seed)
+        if seed is not None:
+            random.seed(seed)
 
         # 1. Generate ground truth with phase-aware constraints
         self.phase = (options or {}).get("phase", 1)
@@ -139,6 +198,24 @@ class TriageEnv(gym.Env):
         self.ordered_labs = set()
         self.episode_log = []
         self.last_patient_status = "CONTINUE"
+
+        # 3a. Reset per-component reward tracker (used for logging,
+        #     anti-farming caps, and GRPO advantage diagnostics).
+        self.reward_components = {
+            "process": 0.0,        # JSON validity, tool legality, basic ops
+            "milestones": 0.0,     # ordered clinical workflow
+            "labs": 0.0,           # lab ordering (critical vs generic)
+            "empathy": 0.0,        # bounded by EMPATHY_REWARD_CAP_*
+            "consent": 0.0,        # AGREE / AMA outcomes
+            "diagnosis": 0.0,      # intermediate Assessment keyword bonus
+            "plan": 0.0,           # intermediate Plan keyword bonus
+            "documentation": 0.0,  # SOAP filled vs empty at discharge
+            "emergency_id": 0.0,   # is_emergency correctly classified
+            "treatment": 0.0,      # terminal judge + keyword combined
+            "penalties": 0.0,      # turn cost, redundancy, early discharge
+        }
+        self.intermediate_diagnosis_awarded = False
+        self.intermediate_plan_awarded = False
 
         # 4. Initialize SOAP EMR and pre-populate with patient history
         self.emr = self._create_empty_emr()
@@ -174,33 +251,69 @@ class TriageEnv(gym.Env):
     # step()
     # ==================================================================
 
+    def _add(self, component: str, value: float) -> float:
+        """Accumulate reward into a tracked component bucket."""
+        self.reward_components[component] = (
+            self.reward_components.get(component, 0.0) + value
+        )
+        return value
+
+    def _add_empathy(self, value: float) -> float:
+        """
+        Accumulate empathy reward with a per-episode cap on both ends to
+        block reward farming (e.g. spam-empathy-then-misdiagnose).
+        Returns the actually applied value (may be 0 if cap reached).
+        """
+        current = self.reward_components.get("empathy", 0.0)
+        if value > 0 and current >= EMPATHY_REWARD_CAP_POS:
+            return 0.0
+        if value < 0 and current <= EMPATHY_REWARD_CAP_NEG:
+            return 0.0
+        # Clip the increment so we never overshoot the cap
+        if value > 0:
+            value = min(value, EMPATHY_REWARD_CAP_POS - current)
+        else:
+            value = max(value, EMPATHY_REWARD_CAP_NEG - current)
+        self.reward_components["empathy"] = current + value
+        return value
+
     def step(self, action: str) -> Tuple[str, float, bool, bool, Dict[str, Any]]:
         """
         Process one Doctor action, run internal Nurse/Patient exchange loop,
         compute dense reward, return next observation.
+
+        Reward design (rebalanced for process > terminal):
+            process (per step):     ~ +0.05 valid JSON, +0.07 milestones, +0.20 critical lab,
+                                      +0.08 update_soap, +0.20-0.30 intermediate diagnosis
+            terminal (one-shot):    smoothed treatment judge in [-0.30, +0.50],
+                                    emergency id ±0.30, SOAP doc ±0.20
+            empathy (per step):     capped at +0.30 / -0.40 across the full episode
+
+        Total max process ≈ +1.5, total max terminal ≈ +1.0 → process-dominant.
         """
         reward = 0.0
         self.step_count += 1
         truncated = False
         info: Dict[str, Any] = {}
 
-        # --- Turn penalty ---
+        # --- Turn penalty (softened so that early decisive actions are not
+        #     wiped out by accumulated turn cost in long episodes). ---
         is_emergency = self.ground_truth.get("disease", {}).get("is_emergency", False)
         if is_emergency:
-            reward += -0.15  # Heavy penalty for wasting time in emergencies
+            reward += self._add("penalties", -0.10)  # was -0.15
         else:
-            reward += -0.01
+            reward += self._add("penalties", -0.01)
 
         # --- Parse Doctor's JSON action ---
         doctor_action = self._parse_doctor_action(action)
         if doctor_action is None:
-            # Invalid JSON
-            reward += -0.20
+            reward += self._add("penalties", -0.15)  # was -0.20
             obs = json.dumps({
                 "event": "system_error",
                 "message": "Your last action was not valid JSON. Please respond with a properly formatted JSON action.",
             })
             self.episode_log.append({"role": "system", "content": "Doctor sent invalid JSON"})
+            info["reward_components"] = dict(self.reward_components)
             return obs, reward, self.done, self._check_truncated(), info
 
         tool = doctor_action.get("tool", "")
@@ -208,15 +321,16 @@ class TriageEnv(gym.Env):
 
         # --- Hallucinated tool check ---
         if tool not in DOCTOR_TOOLS:
-            reward += -0.20
+            reward += self._add("penalties", -0.15)  # was -0.20
             obs = json.dumps({
                 "event": "system_error",
                 "message": f"Unknown tool '{tool}'. Valid tools: speak_to, order_lab, terminal_discharge.",
             })
+            info["reward_components"] = dict(self.reward_components)
             return obs, reward, self.done, self._check_truncated(), info
 
         # --- Valid JSON bonus ---
-        reward += 0.05
+        reward += self._add("process", 0.05)
 
         self.episode_log.append({"role": "doctor", "action": doctor_action})
 
@@ -227,27 +341,32 @@ class TriageEnv(gym.Env):
         if tool == "speak_to":
             obs, step_reward = self._handle_speak_to(doctor_action, target)
             reward += step_reward
-            # Intent-based empathy detection (TTS/reward only, not fed to agents)
             message = doctor_action.get("message", "")
             if message and self.patient_state:
-                intent = classify_intent(message)
+                intent = self.router.evaluate_empathy(message)
                 self.patient_state.update(intent)
-                reward += compute_empathy_reward(intent, self.patient_state, self.phase)
-            # Milestone: patient contact
+                emp_r = compute_empathy_reward(intent, self.patient_state, self.phase)
+                reward += self._add_empathy(emp_r)
             if target == "patient" and self.milestone_tracker:
-                reward += self.milestone_tracker.mark("PATIENT_CONTACT")
+                reward += self._add(
+                    "milestones", self.milestone_tracker.mark("PATIENT_CONTACT")
+                )
 
         elif tool == "order_lab":
             obs, step_reward = self._handle_order_lab(doctor_action)
             reward += step_reward
             if self.milestone_tracker:
-                reward += self.milestone_tracker.mark("LABS")
+                reward += self._add(
+                    "milestones", self.milestone_tracker.mark("LABS")
+                )
 
         elif tool == "read_soap":
             obs, step_reward = self._handle_read_soap(doctor_action)
             reward += step_reward
             if self.milestone_tracker:
-                reward += self.milestone_tracker.mark("READ_SOAP")
+                reward += self._add(
+                    "milestones", self.milestone_tracker.mark("READ_SOAP")
+                )
 
         elif tool == "update_soap":
             obs, step_reward = self._handle_update_soap(doctor_action)
@@ -257,7 +376,9 @@ class TriageEnv(gym.Env):
             obs, step_reward = self._handle_terminal_discharge(doctor_action)
             reward += step_reward
             if self.milestone_tracker:
-                reward += self.milestone_tracker.mark("DISCHARGE")
+                reward += self._add(
+                    "milestones", self.milestone_tracker.mark("DISCHARGE")
+                )
 
         else:
             obs = json.dumps({"event": "system_error", "message": "Unhandled tool."})
@@ -265,11 +386,12 @@ class TriageEnv(gym.Env):
         # Check for truncation (max steps)
         truncated = self._check_truncated()
         if truncated and not self.done:
-            reward += -0.50
+            reward += self._add("penalties", -0.30)  # was -0.50
             info["truncation_reason"] = "max_episode_steps_reached"
 
         info["step_count"] = self.step_count
-        info["reward_breakdown"] = reward
+        info["step_reward"] = round(reward, 4)
+        info["reward_components"] = dict(self.reward_components)
         info["consent_given"] = self.consent_given
         info["patient_status"] = self.last_patient_status
         if self.patient_state:
@@ -335,7 +457,7 @@ class TriageEnv(gym.Env):
 
             # Check for de-escalation success
             if self.last_patient_status == "AGREE":
-                reward += 0.30  # Successful Doctor-led de-escalation
+                reward += self._add("consent", 0.25)  # was 0.30
                 self.consent_given = True
 
             # Check for AMA LOSS
@@ -343,7 +465,7 @@ class TriageEnv(gym.Env):
                 self.last_patient_status == "LEAVE"
                 or patient_response.get("tool") == "leave_hospital"
             ):
-                reward += -0.75  # AMA — patient left, but NOT a clinical error
+                reward += self._add("consent", -0.50)  # was -0.75
                 self.done = True
                 obs = json.dumps({
                     "event": "terminal_ama",
@@ -367,7 +489,17 @@ class TriageEnv(gym.Env):
         return obs, reward
 
     def _handle_order_lab(self, doctor_action: Dict[str, Any]) -> Tuple[str, float]:
-        """Handle Doctor using 'order_lab' tool."""
+        """
+        Handle Doctor using 'order_lab' tool.
+
+        Reward design:
+            redundant order:        -0.20  (was -0.25)
+            critical lab (in disease.critical_labs): +0.20
+            generic informative lab (matches disease lab DB): +0.08
+            non-informative lab (no match):                 +0.02
+        Critical-lab bonus is the key process-distributed signal of correct
+        differential reasoning — without it, lab ordering felt random.
+        """
         reward = 0.0
         test_name = doctor_action.get("test_name", "").strip().lower()
 
@@ -380,7 +512,7 @@ class TriageEnv(gym.Env):
 
         # Redundancy check
         if test_name in self.ordered_labs:
-            reward += -0.25  # Heavy penalty for redundant lab usage
+            reward += self._add("penalties", -0.20)
             obs = json.dumps({
                 "event": "lab_result",
                 "test_name": test_name,
@@ -394,23 +526,37 @@ class TriageEnv(gym.Env):
         # Look up lab results from the ground truth disease
         disease_name = self.ground_truth["disease"]["true_disease"]
         disease_labs = LAB_RESULTS_DB.get(disease_name, {})
+        critical_labs = [
+            c.lower() for c in self.ground_truth["disease"].get("critical_labs", [])
+        ]
 
-        # Fuzzy match: check if test_name substring-matches any key
+        # Is this a critical (diagnosis-clinching) lab?
+        is_critical = any(
+            test_name in c or c in test_name for c in critical_labs if len(c) >= 3
+        )
+
+        # Fuzzy match: check if test_name substring-matches any key in the lab DB
         result_text = None
         for lab_key, lab_value in disease_labs.items():
             if test_name in lab_key.lower() or lab_key.lower() in test_name:
                 result_text = lab_value
                 break
 
+        if is_critical:
+            reward += self._add("labs", 0.20)
+        elif result_text:
+            reward += self._add("labs", 0.08)
+        else:
+            reward += self._add("labs", 0.02)
+
         if result_text:
-            reward += 0.10  # Successful actionable data extraction
             obs = json.dumps({
                 "event": "lab_result",
                 "test_name": test_name,
                 "result": result_text,
                 "redundant": False,
+                "is_critical_lab": is_critical,
             })
-            # Auto-update SOAP Objective with lab result
             self._emr_append("Objective", "Labs", f"[{test_name.upper()}] {result_text}")
         else:
             result_normal = f"Lab '{test_name}' results: within normal limits. No significant findings."
@@ -419,6 +565,7 @@ class TriageEnv(gym.Env):
                 "test_name": test_name,
                 "result": result_normal,
                 "redundant": False,
+                "is_critical_lab": is_critical,
             })
             self._emr_append("Objective", "Labs", f"[{test_name.upper()}] {result_normal}")
 
@@ -456,7 +603,23 @@ class TriageEnv(gym.Env):
     ) -> Tuple[str, float]:
         """
         Handle Doctor using 'update_soap' tool.
-        Doctor can update: Assessment, Plan, or append to Subjective.
+
+        Reward design (KEY rebalance):
+          - Base documentation reward: +0.08 (was +0.05).
+          - Intermediate diagnosis bonus (one-shot per episode):
+              +0.20 if the Assessment text fuzzy-overlaps the true_disease
+                    name and/or true_symptoms by >= 30%
+              +0.30 if overlap >= 60% (strong, clinically reasoned)
+          - Intermediate plan bonus (one-shot per episode):
+              +0.15 if the Plan text fuzzy-overlaps the correct_treatment
+                    keyword set by >= 30%
+              +0.25 if overlap >= 60%
+
+        These bonuses pull the diagnosis-correctness signal *out of the
+        terminal step* and distribute it across the trajectory, which is
+        critical for stable GRPO learning on long horizons. They are
+        one-shot per episode so they cannot be farmed by repeatedly
+        re-writing the same Assessment.
         """
         reward = 0.0
         section = doctor_action.get("section", "").strip()
@@ -472,20 +635,23 @@ class TriageEnv(gym.Env):
         # Parse dotted notation (e.g., "Subjective.HPI")
         parts = section.split(".")
         updated = False
+        section_kind = None  # "Assessment" | "Plan" | "Subjective" | "Objective"
 
         if len(parts) == 1 and parts[0] in ("Assessment", "Plan"):
-            # Direct top-level section update
             self.emr[parts[0]] = content
             updated = True
-            reward += 0.05  # Reward for maintaining documentation
+            section_kind = parts[0]
+            reward += self._add("documentation", 0.08)
         elif len(parts) == 2 and parts[0] == "Subjective" and parts[1] in self.emr.get("Subjective", {}):
             self.emr["Subjective"][parts[1]] = content
             updated = True
-            reward += 0.05
+            section_kind = "Subjective"
+            reward += self._add("documentation", 0.08)
         elif len(parts) == 2 and parts[0] == "Objective" and parts[1] in self.emr.get("Objective", {}):
             self.emr["Objective"][parts[1]] = content
             updated = True
-            reward += 0.05
+            section_kind = "Objective"
+            reward += self._add("documentation", 0.08)
         else:
             obs = json.dumps({
                 "event": "system_error",
@@ -493,12 +659,49 @@ class TriageEnv(gym.Env):
             })
             return obs, reward
 
+        # ----- Intermediate diagnosis bonus (Assessment) -----
+        diag_overlap = 0.0
+        plan_overlap = 0.0
+        if section_kind == "Assessment" and not self.intermediate_diagnosis_awarded:
+            disease = self.ground_truth.get("disease", {})
+            target_text = (
+                disease.get("true_disease", "") + " " +
+                " ".join(disease.get("true_symptoms", []))
+            )
+            target_kw = _keyword_set(target_text)
+            content_kw = _keyword_set(content)
+            diag_overlap = _fuzzy_overlap(target_kw, content_kw)
+            if diag_overlap >= 0.60:
+                reward += self._add("diagnosis", 0.30)
+                self.intermediate_diagnosis_awarded = True
+            elif diag_overlap >= 0.30:
+                reward += self._add("diagnosis", 0.20)
+                self.intermediate_diagnosis_awarded = True
+
+        # ----- Intermediate plan bonus (Plan) -----
+        if section_kind == "Plan" and not self.intermediate_plan_awarded:
+            target_kw = _keyword_set(
+                self.ground_truth.get("disease", {}).get("correct_treatment", "")
+            )
+            content_kw = _keyword_set(content)
+            plan_overlap = _fuzzy_overlap(target_kw, content_kw)
+            if plan_overlap >= 0.60:
+                reward += self._add("plan", 0.25)
+                self.intermediate_plan_awarded = True
+            elif plan_overlap >= 0.30:
+                reward += self._add("plan", 0.15)
+                self.intermediate_plan_awarded = True
+
         if updated:
             obs = json.dumps({
                 "event": "soap_updated",
                 "section": section,
                 "message": f"SOAP note '{section}' updated successfully.",
                 "soap_summary": self._get_soap_summary(),
+                "intermediate_signals": {
+                    "diagnosis_overlap": round(diag_overlap, 2),
+                    "plan_overlap": round(plan_overlap, 2),
+                },
             })
             self.episode_log.append({"role": "doctor", "content": f"Updated SOAP {section}: {content[:100]}"})
 
@@ -507,55 +710,68 @@ class TriageEnv(gym.Env):
     def _handle_terminal_discharge(
         self, doctor_action: Dict[str, Any]
     ) -> Tuple[str, float]:
-        """Handle Doctor using 'terminal_discharge' tool. This ends the episode."""
+        """
+        Handle Doctor using 'terminal_discharge' tool. Ends the episode.
+
+        REWARD REBALANCE (terminal-light, process-heavy):
+          1. Emergency identification:   correct ±0.30, neg correct +0.05,
+                                        false-pos -0.20, missed-true -0.30
+                                        (was ±0.50 / +0.10 / -0.30 / -0.50)
+          2. SOAP Assessment documented: +0.20  /  empty: -0.30  (was -0.50)
+          3. Practiced blind (no read_soap, non-emergency): -0.30 (was -0.50)
+          4. Early discharge:            -0.10 * shortfall   (was -0.15)
+          5. Treatment outcome (the BIG change):
+                Independent dual-verifier: LLM judge + keyword overlap.
+                Final score   = 0.6 * judge_score + 0.4 * keyword_overlap
+                                (when both available; falls back gracefully)
+                Lethal-treatment hard penalty: -0.80 (was -1.50). The dual
+                check requires *both* signals to agree before declaring
+                lethality unilaterally.
+                Treatment terminal reward is now SMOOTH:
+                    base = -0.30 + final_score * 0.90    -> [-0.30, +0.60]
+                    if lethal:  base += -0.80
+                This eliminates the +1.0/-1.0 cliff, distributing partial
+                credit linearly so the policy gradient is well-shaped.
+        """
         reward = 0.0
         treatment = doctor_action.get("treatment", "").strip().lower()
         declared_emergency = bool(doctor_action.get("is_emergency", False))
         is_actual_emergency = self.ground_truth.get("disease", {}).get("is_emergency", False)
         self.done = True
 
-        # --- Emergency Identification Reward ---
+        # --- 1. Emergency Identification (reduced magnitudes) ---
         if declared_emergency and is_actual_emergency:
-            reward += 0.50
-            logger.info("Emergency correctly identified (+0.50).")
+            reward += self._add("emergency_id", 0.30)
         elif not declared_emergency and not is_actual_emergency:
-            reward += 0.10
-            logger.info("Non-emergency correctly identified (+0.10).")
+            reward += self._add("emergency_id", 0.05)
         elif declared_emergency and not is_actual_emergency:
-            reward += -0.30
-            logger.info("False positive emergency identification (-0.30).")
+            reward += self._add("emergency_id", -0.20)
         elif not declared_emergency and is_actual_emergency:
-            reward += -0.50
-            logger.info("Failed to identify true emergency (-0.50).")
+            reward += self._add("emergency_id", -0.30)
 
-        # --- SOAP reward shaping: penalize empty Assessment, reward filled ---
+        # --- 2. SOAP Assessment documented ---
         assessment = self.emr.get("Assessment", "").strip()
         if assessment:
-            reward += 0.20  # Documented clinical reasoning before discharge
-            logger.info("SOAP bonus: Assessment documented before discharge.")
+            reward += self._add("documentation", 0.20)
         else:
-            reward += -0.50  # Heavy penalty for discharging without documenting reasoning
-            logger.info("SOAP penalty: No Assessment documented before discharge.")
+            reward += self._add("documentation", -0.30)
 
-        # --- SOAP reward shaping: penalize ignoring patient history ---
-        is_emergency = self.ground_truth.get("disease", {}).get("is_emergency", False)
-        if self.milestone_tracker and not self.milestone_tracker.achieved.get("READ_SOAP", False) and not is_emergency:
-            reward += -0.50  # Heavy penalty for practicing medicine blind
-            logger.info("SOAP penalty: Discharged without reading patient history (read_soap).")
+        # --- 3. Read patient history before treating (non-emergency) ---
+        is_emergency = is_actual_emergency
+        if (
+            self.milestone_tracker
+            and not self.milestone_tracker.achieved.get("READ_SOAP", False)
+            and not is_emergency
+        ):
+            reward += self._add("documentation", -0.30)
 
-        # --- Early discharge penalty: phase-aware ---
-        # Phase 1: min 4 steps, Phase 2: min 6 steps, Phase 3: min 8 steps
+        # --- 4. Early discharge penalty (softened) ---
         if not is_emergency:
             min_steps_map = {1: 4, 2: 6, 3: 8}
             min_steps = min_steps_map.get(self.phase, 5)
             if self.step_count < min_steps:
                 shortfall = min_steps - self.step_count
-                penalty = -0.15 * shortfall  # -0.15 per missing step
-                reward += penalty
-                logger.info(
-                    f"Early discharge penalty: step {self.step_count} < min {min_steps} "
-                    f"(phase {self.phase}), penalty={penalty:.2f}"
-                )
+                reward += self._add("penalties", -0.10 * shortfall)
 
         # Auto-record the treatment in SOAP Plan
         self.emr["Plan"] = treatment
@@ -566,8 +782,16 @@ class TriageEnv(gym.Env):
         ]
         disease_name = self.ground_truth["disease"]["true_disease"]
 
-        # --- LLM-as-a-Judge Evaluation ---
-        # Use a 70B model to semantically grade the treatment plan
+        # --- 5. INDEPENDENT DUAL VERIFIER ---
+        #     (a) Cheap keyword overlap (always available)
+        correct_kw = _keyword_set(correct_treatment)
+        treatment_kw = _keyword_set(treatment)
+        keyword_overlap = _fuzzy_overlap(correct_kw, treatment_kw)
+        keyword_lethal = any(
+            lethal_kw and lethal_kw in treatment for lethal_kw in lethal_treatments
+        )
+
+        #     (b) LLM-as-a-Judge (70B) — semantic grading
         judge_result = None
         if self.router:
             try:
@@ -577,123 +801,79 @@ class TriageEnv(gym.Env):
                     lethal_treatments=self.ground_truth["disease"]["lethal_treatments"],
                     disease_name=disease_name,
                 )
-                logger.info(f"LLM Judge result: {judge_result}")
             except Exception as e:
-                logger.error(f"LLM Judge failed, falling back to keyword matching: {e}")
+                logger.error(f"LLM Judge failed: {e}")
+                judge_result = None
 
+        judge_score: Optional[float] = None
+        judge_lethal: bool = False
+        judge_reasoning: str = ""
         if judge_result and judge_result.get("score") is not None:
-            # --- LLM Judge path ---
-            score = judge_result["score"]
-            is_lethal = judge_result.get("is_lethal", False)
-            reasoning = judge_result.get("reasoning", "")
+            judge_score = float(judge_result["score"])
+            judge_lethal = bool(judge_result.get("is_lethal", False))
+            judge_reasoning = str(judge_result.get("reasoning", ""))
 
-            if is_lethal:
-                reward += -1.50
-                obs = json.dumps({
-                    "event": "terminal_fatal",
-                    "message": f"CRITICAL ERROR: Lethal treatment administered. {reasoning}",
-                    "ground_truth": disease_name,
-                    "prescribed_treatment": treatment,
-                    "judge_score": score,
-                    "judge_reasoning": reasoning,
-                    "soap_note": self.emr,
-                })
-            elif score >= 0.75:
-                reward += 1.00
-                obs = json.dumps({
-                    "event": "terminal_win",
-                    "message": f"Correct diagnosis and treatment! {reasoning}",
-                    "ground_truth": disease_name,
-                    "prescribed_treatment": treatment,
-                    "judge_score": score,
-                    "judge_reasoning": reasoning,
-                    "soap_note": self.emr,
-                })
-            elif score >= 0.30:
-                partial_reward = -0.40 + (score * 1.4)  # scales from 0.02 to 0.65
-                reward += partial_reward
-                obs = json.dumps({
-                    "event": "terminal_partial",
-                    "message": f"Partially correct treatment (Judge: {score:.0%}). {reasoning}",
-                    "ground_truth": disease_name,
-                    "correct_treatment": self.ground_truth["disease"]["correct_treatment"],
-                    "prescribed_treatment": treatment,
-                    "judge_score": score,
-                    "judge_reasoning": reasoning,
-                    "soap_note": self.emr,
-                })
-            else:
-                reward += -1.00
-                obs = json.dumps({
-                    "event": "terminal_incorrect",
-                    "message": f"Incorrect treatment (Judge: {score:.0%}). {reasoning}",
-                    "ground_truth": disease_name,
-                    "correct_treatment": self.ground_truth["disease"]["correct_treatment"],
-                    "prescribed_treatment": treatment,
-                    "judge_score": score,
-                    "judge_reasoning": reasoning,
-                    "soap_note": self.emr,
-                })
+        # ----- Combine the two independent signals -----
+        # If both available: weighted blend (judge gets 60% as the semantic
+        # signal, keyword gets 40% as the grounding signal). This satisfies
+        # the §7 / §8 guidance: 'multiple independent reward functions' so
+        # the model cannot exploit either one alone.
+        if judge_score is not None:
+            final_score = 0.6 * judge_score + 0.4 * keyword_overlap
+            # Lethal triggers only when BOTH signals agree, OR one signal
+            # is overwhelming (judge_lethal AND keyword_lethal, OR a single
+            # very strong signal). This blocks judge-hallucinated lethality.
+            is_lethal = (judge_lethal and keyword_lethal) or (
+                judge_lethal and judge_score < 0.20
+            ) or (
+                keyword_lethal and judge_score < 0.40
+            )
         else:
-            # --- Fallback: Keyword matching (if LLM Judge unavailable) ---
-            stop_words = {"for", "if", "or", "and", "with", "to", "of", "the", "a", "an", "in", "on", "at", "by", "from", "unable", "po", "signs", "is", "are", "then", "above", "below"}
-            correct_keywords = set(re.findall(r"\w+", correct_treatment)) - stop_words
-            treatment_keywords = set(re.findall(r"\w+", treatment)) - stop_words
+            # Judge unavailable: fall back to keyword-only with a wider band
+            final_score = keyword_overlap
+            is_lethal = keyword_lethal
 
-            overlap = correct_keywords & treatment_keywords
-            for c_kw in correct_keywords - overlap:
-                for t_kw in treatment_keywords:
-                    if len(c_kw) >= 4 and (c_kw in t_kw or t_kw in c_kw):
-                        overlap.add(c_kw)
-                        break
+        # ----- Smooth treatment reward (no cliffs) -----
+        # Linear in [-0.30, +0.60] across final_score in [0, 1].
+        smooth_treatment = -0.30 + final_score * 0.90
+        if is_lethal:
+            smooth_treatment += -0.80   # additional lethal penalty (was -1.50 hard)
+        reward += self._add("treatment", smooth_treatment)
 
-            overlap_ratio = len(overlap) / max(len(correct_keywords), 1)
+        # ----- Build observation -----
+        # Choose a label for telemetry / curriculum scheduler:
+        #   WIN if final_score >= 0.65, FATAL if lethal, INCORRECT if <0.30,
+        #   PARTIAL otherwise.
+        if is_lethal:
+            event = "terminal_fatal"
+            message = "CRITICAL ERROR: Lethal treatment administered."
+        elif final_score >= 0.65:
+            event = "terminal_win"
+            message = "Correct diagnosis and treatment! Patient stabilized."
+        elif final_score >= 0.30:
+            event = "terminal_partial"
+            message = f"Partially correct treatment ({final_score:.0%})."
+        else:
+            event = "terminal_incorrect"
+            message = "Incorrect treatment. Patient outcome: adverse."
 
-            is_lethal = any(lethal_kw in treatment for lethal_kw in lethal_treatments)
-
-            if is_lethal:
-                reward += -1.50
-                obs = json.dumps({
-                    "event": "terminal_fatal",
-                    "message": "CRITICAL ERROR: Lethal treatment administered. Patient death.",
-                    "ground_truth": disease_name,
-                    "prescribed_treatment": treatment,
-                    "soap_note": self.emr,
-                })
-            elif overlap_ratio >= 0.70:
-                reward += 1.00
-                obs = json.dumps({
-                    "event": "terminal_win",
-                    "message": "Correct diagnosis and treatment! Patient stabilized.",
-                    "ground_truth": disease_name,
-                    "prescribed_treatment": treatment,
-                    "match_ratio": round(overlap_ratio, 2),
-                    "soap_note": self.emr,
-                })
-            elif overlap_ratio >= 0.20:
-                partial_reward = -0.40 + (overlap_ratio * 1.2)
-                reward += partial_reward
-                obs = json.dumps({
-                    "event": "terminal_partial",
-                    "message": f"Partially correct treatment ({overlap_ratio:.0%} match). Key interventions missing.",
-                    "ground_truth": disease_name,
-                    "correct_treatment": self.ground_truth["disease"]["correct_treatment"],
-                    "prescribed_treatment": treatment,
-                    "match_ratio": round(overlap_ratio, 2),
-                    "matched_keywords": sorted(overlap),
-                    "soap_note": self.emr,
-                })
-            else:
-                reward += -1.00
-                obs = json.dumps({
-                    "event": "terminal_incorrect",
-                    "message": "Incorrect treatment. Patient outcome: adverse.",
-                    "ground_truth": disease_name,
-                    "correct_treatment": self.ground_truth["disease"]["correct_treatment"],
-                    "prescribed_treatment": treatment,
-                    "match_ratio": round(overlap_ratio, 2),
-                    "soap_note": self.emr,
-                })
+        obs = json.dumps({
+            "event": event,
+            "message": message,
+            "ground_truth": disease_name,
+            "correct_treatment": self.ground_truth["disease"]["correct_treatment"],
+            "prescribed_treatment": treatment,
+            "verifier": {
+                "judge_score": judge_score,
+                "judge_lethal": judge_lethal,
+                "judge_reasoning": judge_reasoning,
+                "keyword_overlap": round(keyword_overlap, 3),
+                "keyword_lethal": keyword_lethal,
+                "final_score": round(final_score, 3),
+                "is_lethal_combined": is_lethal,
+            },
+            "soap_note": self.emr,
+        })
 
         return obs, reward
 

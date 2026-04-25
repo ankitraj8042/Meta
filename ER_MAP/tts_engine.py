@@ -80,78 +80,166 @@ EDGE_VOICE_MAP = {
 }
 
 # ---------------------------------------------------------------------------
-# Emotional Text Transforms — inject natural speech cues per persona
+# Emotional Text Transforms
+#   Tier 1: LLM-powered rewrite (preferred — natural, varied, persona-aware)
+#   Tier 2: Simple random transforms (fallback if no API client)
 # ---------------------------------------------------------------------------
 
-def _hostile_transform(text):
-    """Make text sound aggressive — exclamations, aggressive interjections."""
-    text = text.replace('. ', '! ')
-    if not text.endswith('!') and not text.endswith('?'):
-        text = text.rstrip('.') + '!'
-    interjections = ["Look, ", "Listen! ", "I said, ", "For God's sake, "]
-    if random.random() < 0.4 and len(text) > 20:
-        text = random.choice(interjections) + text[0].lower() + text[1:]
-    return text
-
-
-def _anxious_transform(text):
-    """Make text sound panicked — stuttering, filler words, rushing."""
-    words = text.split()
-    result = []
-    for i, word in enumerate(words):
-        if i < 3 and random.random() < 0.3 and len(word) > 2:
-            result.append(word[0] + '-' + word)
-        elif random.random() < 0.15:
-            filler = random.choice(['um,', 'uh,', 'oh god,', 'please,'])
-            result.append(filler)
-            result.append(word)
-        else:
-            result.append(word)
-    text = ' '.join(result)
-    if not text.endswith('!') and not text.endswith('?'):
-        text += '... please!'
-    return text
-
-
-def _confused_transform(text):
-    """Make text sound disorganized — pauses, restarts, uncertainty."""
-    words = text.split()
-    result = []
-    for i, word in enumerate(words):
-        if random.random() < 0.12:
-            filler = random.choice(['uh...', 'wait...', 'I mean...', 'what was I...'])
-            result.append(filler)
-        result.append(word)
-    text = ' '.join(result)
-    if random.random() < 0.5:
-        text = 'I... ' + text[0].lower() + text[1:]
-    return text
-
-
-def _rookie_transform(text):
-    """Make text sound uncertain — hedging language."""
-    hedges = ['I think ', 'It looks like ', 'Um, ', 'So, ']
-    if random.random() < 0.4 and not text.startswith(('I think', 'It looks', 'Um')):
-        text = random.choice(hedges) + text[0].lower() + text[1:]
-    return text
-
-
-EMOTION_TRANSFORMS = {
-    "patient_hostile_aggressive":    _hostile_transform,
-    "patient_anxious_panicked":      _anxious_transform,
-    "patient_calm_stoic":            lambda t: t,
-    "patient_disorganized_confused": _confused_transform,
-    "nurse_rookie":                  _rookie_transform,
-    "nurse_standard":                lambda t: t,
-    "nurse_veteran":                 lambda t: t,
-    "doctor":                        lambda t: t,
+# ---- Persona instructions for the LLM emotion adapter ----
+_PERSONA_INSTRUCTIONS = {
+    "patient_hostile_aggressive": (
+        "You are an angry, hostile patient in an ER. "
+        "Rewrite this text to sound aggressive, impatient, confrontational. "
+        "Add sharp exclamations, interrupting interjections (Look!, Listen!, I said!), "
+        "short frustrated sentences. Replace periods with exclamation marks where natural. "
+        "Include ElevenLabs tags: [frustrated], [sigh], and use '—' for sharp pauses. "
+        "Make every rewrite UNIQUE — never repeat the same pattern twice. "
+        "Vary the intensity: sometimes seething quiet rage, sometimes explosive anger."
+    ),
+    "patient_anxious_panicked": (
+        "You are a terrified, panicking patient in an ER. "
+        "Rewrite this text to sound breathless, scared, and rushed. "
+        "Add stuttering (w-what, I-I can't), filler words (um, oh god, please), "
+        "trailing off (using ...), and voice breaks. "
+        "Include ElevenLabs tags: [nervous], [gasps], [stammers], [short pause]. "
+        "Vary the panic level: sometimes hyperventilating terror, sometimes "
+        "quiet trembling fear, sometimes tearful pleading. Never repeat the same opener."
+    ),
+    "patient_calm_stoic": (
+        "You are a calm, stoic patient in an ER. "
+        "Rewrite this text with measured, composed speech. "
+        "Add thoughtful pauses (...), understated reactions. "
+        "Include ElevenLabs tags: [calm], [short pause]. "
+        "Keep the tone steady and slightly detached, but natural — not robotic."
+    ),
+    "patient_disorganized_confused": (
+        "You are a confused, disoriented patient in an ER. "
+        "Rewrite this text to sound scattered and lost. "
+        "Add mid-sentence restarts (wait... what was I...), long pauses, "
+        "jumbled word order, and trailing thoughts. "
+        "Include ElevenLabs tags: [stammers], [long pause], [short pause]. "
+        "Vary confusion style: sometimes foggy, sometimes tangential rambling, "
+        "sometimes childlike simplicity. Never use the same filler twice in a row."
+    ),
+    "nurse_rookie": (
+        "You are a nervous rookie nurse in an ER. "
+        "Rewrite this text with hedging language (I think, it seems like, um), "
+        "slight uncertainty, and over-explanation. "
+        "Include ElevenLabs tags: [clears throat], [nervous]. "
+        "Sometimes confident on facts but unsure on interpretation."
+    ),
+    "nurse_standard": (
+        "You are a professional ER nurse. "
+        "Rewrite this text to sound crisp and efficient. "
+        "Minimal emotional color — just professional delivery. "
+        "You may add brief [short pause] between medical facts."
+    ),
+    "nurse_veteran": (
+        "You are a veteran ER nurse who has seen everything. "
+        "Rewrite this text with calm authority, maybe slight weariness. "
+        "Occasional [sigh] before delivering routine information. "
+        "Direct, no-nonsense phrasing."
+    ),
+    "doctor": (
+        "You are a calm, authoritative ER doctor. "
+        "Rewrite this text with measured, professional delivery. "
+        "Add [calm] and [short pause] tags for thoughtful pacing. "
+        "Warm but clinical."
+    ),
 }
 
 
-def apply_emotion_transform(text, voice_key):
-    """Apply persona-appropriate emotional text transformation."""
-    transform = EMOTION_TRANSFORMS.get(voice_key, lambda t: t)
-    return transform(text)
+def emotionalize_for_tts(text: str, voice_key: str, groq_client=None, model: str = "llama-3.3-70b-versatile") -> str:
+    """
+    LLM-powered emotion adapter for ElevenLabs TTS.
+
+    Takes clean, clinical LLM agent text and rewrites it into emotionally
+    expressive natural speech WITH ElevenLabs audio tags.
+
+    This function is ONLY called in the TTS pipeline — the emotionalized
+    text never reaches the RL agents, so agent behavior is unaffected.
+
+    Args:
+        text: Clean agent message text
+        voice_key: Persona voice key (e.g. "patient_anxious_panicked")
+        groq_client: Optional Groq API client. Falls back to regex transforms if None.
+        model: Model to use for rewriting (default: 70B)
+
+    Returns:
+        Emotionally rewritten text with ElevenLabs audio tags.
+    """
+    if not text or len(text.strip()) < 5:
+        return text
+
+    persona_instruction = _PERSONA_INSTRUCTIONS.get(voice_key)
+    if not persona_instruction or groq_client is None:
+        # Fallback to simple regex transforms
+        return _fallback_emotion_transform(text, voice_key)
+
+    prompt = (
+        f"{persona_instruction}\n\n"
+        f"ORIGINAL TEXT:\n\"{text}\"\n\n"
+        f"RULES:\n"
+        f"- Output ONLY the rewritten speech text. No quotes, no labels, no explanations.\n"
+        f"- Keep the medical content and meaning EXACTLY the same.\n"
+        f"- Only change HOW it is said, not WHAT is said.\n"
+        f"- Add ElevenLabs audio tags like [sigh], [gasps], [nervous], [calm], etc.\n"
+        f"- Use '...' for trailing off and '—' for sharp pauses.\n"
+        f"- Keep the output under {len(text) + 80} characters.\n"
+        f"- Make it sound like a REAL person talking, not a script."
+    )
+
+    try:
+        completion = groq_client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "You rewrite clinical text into emotionally expressive natural speech for text-to-speech synthesis. Output ONLY the rewritten text."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.9,  # High temp for variety — prevents repetition
+            max_tokens=256,
+        )
+        result = (completion.choices[0].message.content or "").strip()
+        # Strip any accidental quotes the model wraps around the output
+        if result.startswith('"') and result.endswith('"'):
+            result = result[1:-1]
+        if result and len(result) > 5:
+            return result
+        return _fallback_emotion_transform(text, voice_key)
+    except Exception as e:
+        logger.warning(f"LLM emotion adapter failed ({voice_key}): {e}")
+        return _fallback_emotion_transform(text, voice_key)
+
+
+def _fallback_emotion_transform(text: str, voice_key: str) -> str:
+    """Simple regex-based fallback when LLM adapter is unavailable."""
+    if voice_key == "patient_hostile_aggressive":
+        text = text.replace('. ', '! ')
+        if not text.endswith('!') and not text.endswith('?'):
+            text = text.rstrip('.') + '!'
+        interjections = ["Look, ", "Listen! ", "I said, ", "For God's sake, "]
+        if random.random() < 0.4 and len(text) > 20:
+            text = random.choice(interjections) + text[0].lower() + text[1:]
+    elif voice_key == "patient_anxious_panicked":
+        words = text.split()
+        result = []
+        for i, word in enumerate(words):
+            if i < 3 and random.random() < 0.3 and len(word) > 2:
+                result.append(word[0] + '-' + word)
+            elif random.random() < 0.15:
+                result.append(random.choice(['um,', 'uh,', 'oh god,']))
+                result.append(word)
+            else:
+                result.append(word)
+        text = ' '.join(result)
+    elif voice_key == "patient_disorganized_confused":
+        if random.random() < 0.5:
+            text = 'I... ' + text[0].lower() + text[1:]
+    elif voice_key == "nurse_rookie":
+        hedges = ['I think ', 'It looks like ', 'Um, ']
+        if random.random() < 0.4:
+            text = random.choice(hedges) + text[0].lower() + text[1:]
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -306,18 +394,26 @@ class TTSEngine:
     """
     Emotion-induced neural TTS engine for ER-MAP agents.
 
+    Two-layer emotion system:
+      Layer 1: LLM Emotion Adapter (70B) — rewrites clean text into
+               emotionally expressive natural speech with ElevenLabs tags.
+               Only used for TTS; RL agents never see the rewritten text.
+      Layer 2: ElevenLabs voice settings — stability, style, speed tuned
+               per persona for vocal quality.
+
     Supports ElevenLabs (premium, ultra-realistic) with automatic
     Edge-TTS fallback (free, unlimited). Each agent gets a unique
     voice mapped to their persona traits.
     """
 
-    def __init__(self, elevenlabs_api_key: Optional[str] = None):
+    def __init__(self, elevenlabs_api_key: Optional[str] = None, groq_api_key: Optional[str] = None):
         self.api_key = elevenlabs_api_key or os.environ.get("ELEVENLABS_API_KEY", "")
         self.use_elevenlabs = False
         self._eleven_client = None
         self._pygame = None
         self._has_pygame = False
-
+        self._groq_client = None
+        self._groq_model = "llama-3.3-70b-versatile"
         # Initialize ElevenLabs
         if self.api_key:
             try:
@@ -330,6 +426,18 @@ class TTSEngine:
 
         if not self.use_elevenlabs:
             logger.info("TTS Engine: Edge-TTS (free fallback)")
+
+        # Initialize Groq client for LLM Emotion Adapter
+        _groq_key = groq_api_key or os.environ.get("GROQ_NURSE_API_KEY") or os.environ.get("GROQ_API_KEY", "")
+        if _groq_key:
+            try:
+                from groq import Groq
+                self._groq_client = Groq(api_key=_groq_key)
+                logger.info("TTS Emotion Adapter: LLM-powered (70B)")
+            except ImportError:
+                logger.warning("groq package not installed. Using regex emotion fallback.")
+        else:
+            logger.info("TTS Emotion Adapter: regex fallback (no GROQ key)")
 
         # Initialize pygame for audio playback
         try:
@@ -363,18 +471,26 @@ class TTSEngine:
             return None
 
         voice_key = get_voice_key(agent, ground_truth)
-        text = apply_emotion_transform(text, voice_key)
-        logger.info(f"TTS [{voice_key}]: {text[:100]}")
+
+        # Layer 1: LLM Emotion Adapter — rewrites clean text into
+        # emotionally expressive natural speech. Falls back to regex
+        # transforms if no Groq client is available.
+        text = emotionalize_for_tts(text, voice_key, self._groq_client, self._groq_model)
+        logger.info(f"TTS [{voice_key}]: {text[:120]}")
 
         try:
             if self.use_elevenlabs:
-                # ElevenLabs v3 supports [sigh], [nervous] etc.
+                # Layer 2: ElevenLabs audio tags ([sigh], [nervous])
+                # added on top of the LLM-rewritten text
                 text_el = _inject_speech_markers(text, voice_key)
                 return self._generate_elevenlabs(text_el, voice_key)
             else:
-                # Edge-TTS does NOT support bracketed tags — use clean text
-                # Only keep ellipses and em-dashes for pacing
-                return self._generate_edge(text, voice_key)
+                # Edge-TTS does NOT support bracketed tags — strip them
+                import re as _re
+                clean_for_edge = _re.sub(r'\[.*?\]', '', text).strip()
+                if len(clean_for_edge) < 3:
+                    clean_for_edge = text
+                return self._generate_edge(clean_for_edge, voice_key)
         except Exception as e:
             logger.error(f"TTS generation failed ({voice_key}): {e}")
             print(f"  [TTS ERROR] voice_key={voice_key} agent={agent}: {e}", flush=True)
