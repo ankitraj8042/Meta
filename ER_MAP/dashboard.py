@@ -47,15 +47,14 @@ _DEMO_KEYS = {
     "GROQ_MEDICAL_JUDGE_API_KEY":   "",
 
     # --- Per-role models (traffic-shaping for free-tier budget) ---
-    # High-volume agents (Doctor / Nurse / Patient — fire on every env
-    # step) run the 8B-instant pool: 14 400 RPD / 500K TPD per account.
-    # The two judges fire mostly on terminal events but their grading
-    # quality directly shapes the reward, so they stay on 70B-versatile
-    # (1 000 RPD / 100K TPD pool — separate budget).
+    # High-volume agents (Doctor / Nurse / Patient / Empathy Judge) run
+    # the 8B-instant pool: 14 400 RPD / 500K TPD per account. Empathy
+    # fires 5-10x per episode so it MUST be 8B to avoid rate limits.
+    # Medical judge fires once per episode; stays on 70B for quality.
     "ERMAP_DOCTOR_MODEL":           "llama-3.1-8b-instant",
     "ERMAP_NURSE_MODEL":            "llama-3.1-8b-instant",
     "ERMAP_PATIENT_MODEL":          "llama-3.1-8b-instant",
-    "ERMAP_EMPATHY_JUDGE_MODEL":    "llama-3.3-70b-versatile",
+    "ERMAP_EMPATHY_JUDGE_MODEL":    "llama-3.1-8b-instant",
     "ERMAP_MEDICAL_JUDGE_MODEL":    "llama-3.3-70b-versatile",
 
     # --- ElevenLabs (single shared instance for UI voice) — populate via .env ---

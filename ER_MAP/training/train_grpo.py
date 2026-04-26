@@ -363,13 +363,13 @@ def generate_doctor_action(
     tokenizer,
     observation: str,
     device: str = "cuda",
-    max_new_tokens: int = 256,
+    max_new_tokens: int = 192,
     temperature: float = 0.7,
 ) -> str:
     """Generate Doctor's JSON action from observation."""
     prompt = f"{DOCTOR_SYSTEM_PROMPT}\n\nObservation:\n{observation}\n\nJSON Action:"
 
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1536)
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024)
     inputs = {k: v.to(device) for k, v in inputs.items()}
 
     with torch.no_grad():
@@ -998,6 +998,14 @@ def train(
 
         # --- GRPO update over the group ---
         if not dry_run and trajectories:
+            # Flush stale generation caches before the backward-heavy GRPO
+            # step.  On T4 (15.6 GB) the generation KV-cache + leftover
+            # activations can fragment memory enough to cause OOM during the
+            # first backward call even though total free bytes would suffice.
+            import gc as _gc
+            _gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             try:
                 stats = manual_grpo_step(
                     model, ref_model, tokenizer, trajectories,
