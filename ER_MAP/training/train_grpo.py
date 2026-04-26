@@ -363,13 +363,13 @@ def generate_doctor_action(
     tokenizer,
     observation: str,
     device: str = "cuda",
-    max_new_tokens: int = 192,
+    max_new_tokens: int = 128,
     temperature: float = 0.7,
 ) -> str:
     """Generate Doctor's JSON action from observation."""
     prompt = f"{DOCTOR_SYSTEM_PROMPT}\n\nObservation:\n{observation}\n\nJSON Action:"
 
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024)
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
     inputs = {k: v.to(device) for k, v in inputs.items()}
 
     with torch.no_grad():
@@ -523,7 +523,7 @@ def _ref_logprob_with_disabled_adapter(
     prompt: str,
     response: str,
     device: str,
-    max_seq_length: int = 1024,
+    max_seq_length: int = 512,
 ) -> Tuple[torch.Tensor, int]:
     """
     Compute reference (no-LoRA) log-prob by temporarily disabling the
@@ -559,7 +559,7 @@ def manual_grpo_step(
     optimizer,
     beta: float = 0.04,
     device: str = "cuda",
-    max_seq_length: int = 1024,
+    max_seq_length: int = 512,
 ) -> Dict[str, float]:
     """
     Apply one GRPO update over a group of G trajectories that share the
@@ -930,6 +930,7 @@ def train(
                     },
                 }
             else:
+                model.eval()
                 trajectory = run_episode(
                     model, tokenizer, env, env_options,
                     seed=group_seed, device=device,
@@ -998,10 +999,13 @@ def train(
 
         # --- GRPO update over the group ---
         if not dry_run and trajectories:
-            # Flush stale generation caches before the backward-heavy GRPO
-            # step.  On T4 (15.6 GB) the generation KV-cache + leftover
-            # activations can fragment memory enough to cause OOM during the
-            # first backward call even though total free bytes would suffice.
+            # Switch from eval → train, flush caches, re-enable gradient
+            # checkpointing (Unsloth may disable it during generate()).
+            model.train()
+            try:
+                model.gradient_checkpointing_enable()
+            except Exception:
+                pass
             import gc as _gc
             _gc.collect()
             if torch.cuda.is_available():
