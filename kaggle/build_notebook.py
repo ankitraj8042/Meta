@@ -342,9 +342,9 @@ CELL_06_REPO = """\
 import os, subprocess, sys
 
 # OPTION A: clone a public GitHub fork (preferred). Edit GIT_URL.
-GIT_URL    = "https://github.com/VaibhavDeopa/Multi-Agents-for-Clinical-Decision-Making.git"
+GIT_URL    = "https://github.com/ankitraj8042/Meta.git"
 BRANCH     = "main"
-REPO_ROOT  = "/kaggle/working/Multi-Agents-for-Clinical-Decision-Making"
+REPO_ROOT  = "/kaggle/working/Meta"
 
 # OPTION B: Kaggle Dataset upload — set this if you uploaded the repo
 # as a Kaggle Dataset named "ermap-source" (Add Data -> Upload).
@@ -839,7 +839,7 @@ exports them as env vars.
 
 ## 3. Edit two placeholders in the notebook
 
-- **Cell 6:** `GIT_URL = "https://github.com/VaibhavDeopa/Multi-Agents-for-Clinical-Decision-Making.git"` (or your own fork)
+- **Cell 6:** `GIT_URL = "https://github.com/ankitraj8042/Meta.git"` (or your own fork)
 - **Cell 8:** `HF_PUSH_REPO = "ankitraj86/ermap-doctor-lora"` (your HF username)
 
 If you uploaded the repo as a Kaggle Dataset instead, leave `GIT_URL` as the
@@ -854,7 +854,7 @@ there.
 | 3 | **REPAIR** — pin torch 2.10 cu128, reinstall bitsandbytes, upgrade unsloth | `REPAIR OK` (or `RESTART REQUIRED`) |
 | **(restart)** | If cell 3 said RESTART REQUIRED → Run → Restart kernel | — |
 | 5 | Post-restart import verify | All `OK`, GPUs listed |
-| 6 | Clone / mount the repo | `OK. Repo at /kaggle/working/Multi-Agents-for-Clinical-Decision-Making` |
+| 6 | Clone / mount the repo | `OK. Repo at /kaggle/working/Meta` |
 | 7 | Wire Kaggle Secrets → env vars | `OK — at least one Groq key is wired` |
 | 8 | HF Hub config | `Starting fresh — no resume.` |
 | 9 | Hyperparameters (P1=+1.2, P2=+1.1, P3=+1.0) | thresholds printed |
