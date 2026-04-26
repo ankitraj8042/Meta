@@ -395,7 +395,11 @@ print("OK — at least one Groq key is wired.")
 CELL_08_HF = """\
 # === CELL 8 — Hugging Face Hub config (for checkpoint backup) ===
 import os
-from kaggle_helpers import push_checkpoint_to_hub, download_checkpoint_from_hub
+from kaggle_helpers import (
+    push_checkpoint_to_hub,
+    download_checkpoint_from_hub,
+    push_file_to_hub,
+)
 
 # EDIT the line below to your HF model id (e.g. "udayd/ermap-doctor-lora").
 HF_PUSH_REPO   = "ankitraj86/ermap-doctor-lora"
@@ -567,11 +571,19 @@ def save_lora_adapters_with_push(model, tokenizer, output_dir):
                 output_dir, HF_PUSH_REPO,
                 commit_message=f"checkpoint @ {os.path.basename(output_dir)}",
             )
+            # training_metrics.json lives in the *parent* of each checkpoint_*
+            # subdir (written just before this save; see train_grpo.py)
+            mpath = os.path.join(os.path.dirname(output_dir), "training_metrics.json")
+            if os.path.isfile(mpath):
+                push_file_to_hub(
+                    mpath, HF_PUSH_REPO, "training_metrics.json",
+                    commit_message="training_metrics.json (rolling reward, per-ep logs)",
+                )
         except Exception as e:
             print(f"  [hub-push] non-fatal failure: {e}")
 
 _tg.save_lora_adapters = save_lora_adapters_with_push
-print("Hub-push hook installed.")
+print("Hub-push hook installed (LoRA + training_metrics.json).")
 """
 
 CELL_13_TRAIN_MD = """\

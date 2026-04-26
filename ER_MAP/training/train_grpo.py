@@ -1053,6 +1053,12 @@ def train(
 
         # --- Periodic checkpoint (LoRA adapters) ---
         if episode_idx % (group_size * 5) == 0 and not dry_run:
+            # Write metrics FIRST so the Kaggle hub-push hook (which runs inside
+            # save_lora_adapters) can upload a fresh `training_metrics.json` to
+            # HF alongside each checkpoint.
+            metrics_path = os.path.join(output_dir, "training_metrics.json")
+            with open(metrics_path, "w") as f:
+                json.dump(metrics_log, f, indent=2)
             ckpt_path = os.path.join(
                 output_dir,
                 f"checkpoint_ep{episode_idx}_phase{scheduler.phase_id}",
@@ -1061,10 +1067,6 @@ def train(
                 save_lora_adapters(model, tokenizer, ckpt_path)
             except Exception as e:
                 logger.error(f"  Checkpoint failed: {e}")
-
-            metrics_path = os.path.join(output_dir, "training_metrics.json")
-            with open(metrics_path, "w") as f:
-                json.dump(metrics_log, f, indent=2)
 
         # --- Rolling stats every group ---
         s = scheduler.get_summary()

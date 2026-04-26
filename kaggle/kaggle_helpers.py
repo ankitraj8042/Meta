@@ -159,6 +159,45 @@ def push_checkpoint_to_hub(
         return False
 
 
+def push_file_to_hub(
+    local_path: str,
+    repo_id: str,
+    path_in_repo: str,
+    *,
+    commit_message: str = "upload metrics / artifact",
+    private: bool = True,
+    hf_token: Optional[str] = None,
+) -> bool:
+    """
+    Upload a single file (e.g. ``training_metrics.json``) to a Hub repo
+    at ``path_in_repo`` so the browser can show rolling reward without SSH.
+    """
+    p = Path(local_path)
+    if not p.is_file():
+        return False
+    token = hf_token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
+    if not token:
+        return False
+    try:
+        from huggingface_hub import HfApi, create_repo
+    except ImportError:
+        return False
+    try:
+        create_repo(repo_id, private=private, token=token, exist_ok=True)
+        api = HfApi(token=token)
+        api.upload_file(
+            path_or_fileobj=str(p),
+            path_in_repo=path_in_repo,
+            repo_id=repo_id,
+            commit_message=commit_message,
+        )
+        logger.info(f"Pushed {p.name} -> https://huggingface.co/{repo_id}/blob/main/{path_in_repo}")
+        return True
+    except Exception as e:
+        logger.error(f"push_file_to_hub failed: {e}")
+        return False
+
+
 def download_checkpoint_from_hub(
     repo_id: str,
     local_dir: str,
