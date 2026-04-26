@@ -96,14 +96,27 @@ def _get_env() -> TriageEnv:
     """Lazily construct a single shared TriageEnv per server process."""
     global _ENV
     if _ENV is None:
+        shared = os.environ.get("GROQ_API_KEY", "")
         _ENV = TriageEnv(
-            groq_api_key=os.environ.get("GROQ_API_KEY", ""),
-            nurse_api_key=os.environ.get("GROQ_NURSE_API_KEY", ""),
-            patient_api_key=os.environ.get("GROQ_PATIENT_API_KEY", ""),
-            model=os.environ.get("ERMAP_MODEL", "llama-3.3-70b-versatile"),
+            groq_api_key=shared,
+            nurse_api_key=os.environ.get("GROQ_NURSE_API_KEY", "") or shared,
+            patient_api_key=os.environ.get("GROQ_PATIENT_API_KEY", "") or shared,
+            empathy_judge_api_key=os.environ.get("GROQ_EMPATHY_JUDGE_API_KEY", "") or shared,
+            medical_judge_api_key=os.environ.get("GROQ_MEDICAL_JUDGE_API_KEY", "") or shared,
+            model=os.environ.get("ERMAP_MODEL", "llama-3.1-8b-instant"),
+            nurse_model=os.environ.get("ERMAP_NURSE_MODEL"),
+            patient_model=os.environ.get("ERMAP_PATIENT_MODEL"),
+            empathy_judge_model=os.environ.get("ERMAP_EMPATHY_JUDGE_MODEL"),
+            medical_judge_model=os.environ.get("ERMAP_MEDICAL_JUDGE_MODEL"),
             render_mode=None,
         )
-        logger.info("TriageEnv initialized.")
+        logger.info(
+            "TriageEnv initialized. judges_wired=%s",
+            {
+                "empathy": bool(os.environ.get("GROQ_EMPATHY_JUDGE_API_KEY") or shared),
+                "medical": bool(os.environ.get("GROQ_MEDICAL_JUDGE_API_KEY") or shared),
+            },
+        )
     return _ENV
 
 

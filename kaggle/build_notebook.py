@@ -342,9 +342,9 @@ CELL_06_REPO = """\
 import os, subprocess, sys
 
 # OPTION A: clone a public GitHub fork (preferred). Edit GIT_URL.
-GIT_URL    = "https://github.com/<your-fork>/Meta_Finals.git"
+GIT_URL    = "https://github.com/VaibhavDeopa/Multi-Agents-for-Clinical-Decision-Making.git"
 BRANCH     = "main"
-REPO_ROOT  = "/kaggle/working/Meta_Finals"
+REPO_ROOT  = "/kaggle/working/Multi-Agents-for-Clinical-Decision-Making"
 
 # OPTION B: Kaggle Dataset upload — set this if you uploaded the repo
 # as a Kaggle Dataset named "ermap-source" (Add Data -> Upload).
@@ -398,7 +398,7 @@ import os
 from kaggle_helpers import push_checkpoint_to_hub, download_checkpoint_from_hub
 
 # EDIT the line below to your HF model id (e.g. "udayd/ermap-doctor-lora").
-HF_PUSH_REPO   = "<your-username>/ermap-doctor-lora"
+HF_PUSH_REPO   = "ankitraj86/ermap-doctor-lora"
 # To resume from a previous run, paste the same repo id here. Empty = fresh.
 HF_RESUME_REPO = ""
 
@@ -419,6 +419,11 @@ if "<your-username>" in HF_PUSH_REPO:
 CELL_09_HYPERPARAMS = """\
 # === CELL 9 — GRPO hyperparameters ===
 import os
+
+# --- CUDA memory: expandable_segments avoids fragmentation-OOM on T4 -------
+# Without this, PyTorch's CUDA caching allocator can fail to find a contiguous
+# block for a new allocation even when enough total free memory exists.
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 MODEL_NAME       = "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit"
 GROUP_SIZE       = 2
@@ -447,11 +452,13 @@ os.environ["ERMAP_MAX_INTERNAL_EXCHANGES"] = "5"
 
 # --- Groq traffic-shaping (8B for actors, 70B for judges) ------------------
 # High-volume conversational roles (Nurse + Patient) on the 8B-instant pool
-# (500K TPD, 14,400 RPD); the two judges stay on 70B-versatile because their
-# grading quality directly shapes the reward signal.
+# (500K TPD, 14,400 RPD). Empathy judge fires on EVERY speak_to call
+# (~5-10x/episode) so it uses 8B-instant (500K TPD) to avoid rate limits.
+# Medical judge fires once per episode at terminal_discharge — stays on 70B
+# for treatment-correctness grading quality.
 os.environ["ERMAP_NURSE_MODEL"]            = "llama-3.1-8b-instant"
 os.environ["ERMAP_PATIENT_MODEL"]          = "llama-3.1-8b-instant"
-os.environ["ERMAP_EMPATHY_JUDGE_MODEL"]    = "llama-3.3-70b-versatile"
+os.environ["ERMAP_EMPATHY_JUDGE_MODEL"]    = "llama-3.1-8b-instant"
 os.environ["ERMAP_MEDICAL_JUDGE_MODEL"]    = "llama-3.3-70b-versatile"
 
 print("Hyperparameters set:")
@@ -461,7 +468,9 @@ print(f"  PHASE_REWARD_TARGETS = {PHASE_REWARD_TARGETS}")
 print(f"  PHASE_MIN_WIN_RATE   = {PHASE_MIN_WIN_RATE}")
 print(f"  CONVERGENCE_WINDOW   = {CONVERGENCE_WINDOW}")
 print(f"  Nurse / Patient      = llama-3.1-8b-instant (actors, high-volume)")
-print(f"  Empathy / Med Judge  = llama-3.3-70b-versatile (graders, quality)")
+print(f"  Empathy judge        = llama-3.1-8b-instant (high-volume, 500K TPD)")
+print(f"  Medical judge        = llama-3.3-70b-versatile (once/episode, quality)")
+print(f"  PYTORCH_CUDA_ALLOC_CONF = expandable_segments:True (OOM guard)")
 """
 
 CELL_10_PREFLIGHT = """\
@@ -477,7 +486,7 @@ router = AgentRouter()
 expected = {
     "nurse":         "llama-3.1-8b-instant",
     "patient":       "llama-3.1-8b-instant",
-    "empathy_judge": "llama-3.3-70b-versatile",
+    "empathy_judge": "llama-3.1-8b-instant",
     "medical_judge": "llama-3.3-70b-versatile",
 }
 
@@ -703,6 +712,81 @@ for i in range(3):
     print(generate_doctor_action(trained, tok, test_obs, max_new_tokens=160))
 """
 
+CELL_18_COMPARE_MD = """\
+## 18 · Trained-vs-Baseline comparison plot
+
+Pulls the local `baseline_results.json` (uploaded to the HF model repo from
+the dev box where matplotlib actually works) and the in-Kaggle
+`training_metrics.json`, then renders the 2x2 comparison panel that goes
+into the README and the blog post.
+"""
+
+CELL_18_COMPARE = """\
+# === CELL 18 — Trained-vs-Baseline comparison plot ===
+import os, json, urllib.request
+from pathlib import Path
+
+REPO_ROOT_LOCAL = REPO_ROOT  # set in cell 6
+
+def _download(url: str, dest: Path) -> bool:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            dest.write_bytes(resp.read())
+        return True
+    except Exception as e:
+        print(f"  download {url} FAILED: {type(e).__name__}: {str(e)[:120]}")
+        return False
+
+# 1. Pull both baseline_results.json AND make_comparison_plot.py from the
+#    HF model repo (uploaded from the dev box where matplotlib actually
+#    works). The cloned GitHub repo doesn't have these.
+plot_helper = Path(REPO_ROOT_LOCAL) / "docs" / "make_comparison_plot.py"
+baseline_target = Path(REPO_ROOT_LOCAL) / "baseline_eval" / "baseline_results.json"
+
+base = f"https://huggingface.co/{HF_PUSH_REPO}/resolve/main"
+ok_helper   = _download(f"{base}/make_comparison_plot.py", plot_helper)
+ok_baseline = _download(f"{base}/baseline_results.json",   baseline_target)
+
+if ok_baseline:
+    n = len(json.loads(baseline_target.read_text()))
+    print(f"  -> baseline: {n} records")
+if ok_helper:
+    print(f"  -> plot helper: {plot_helper}")
+
+if not ok_helper:
+    print("Plot helper not found on HF Hub. Skipping comparison plot.")
+else:
+    # 2. Run the comparison plot helper
+    metrics_path = f"{OUTPUT_DIR}/training_metrics.json"
+    out_png  = f"{OUTPUT_DIR}/trained_vs_baseline.png"
+    out_json = f"{OUTPUT_DIR}/trained_vs_baseline_summary.json"
+
+    !python {plot_helper} \\
+        --baseline {baseline_target} \\
+        --metrics  {metrics_path} \\
+        --out-png  {out_png} \\
+        --out-json {out_json} \\
+        --window   10
+
+    # 3. Push the comparison plot to the HF model repo
+    if HF_PUSH_REPO and "<your-username>" not in HF_PUSH_REPO:
+        from huggingface_hub import upload_file
+        for src in [out_png, out_json]:
+            if os.path.isfile(src):
+                try:
+                    upload_file(
+                        path_or_fileobj=src,
+                        path_in_repo=os.path.basename(src),
+                        repo_id=HF_PUSH_REPO,
+                        repo_type="model",
+                        commit_message=f"add {os.path.basename(src)} (trained vs baseline)",
+                    )
+                    print(f"Pushed {os.path.basename(src)} -> {HF_PUSH_REPO}")
+                except Exception as e:
+                    print(f"FAIL push {src}: {type(e).__name__}: {str(e)[:120]}")
+"""
+
 
 # ---------------------------------------------------------------------------
 # Quickstart markdown (sibling file)
@@ -755,8 +839,8 @@ exports them as env vars.
 
 ## 3. Edit two placeholders in the notebook
 
-- **Cell 6:** `GIT_URL = "https://github.com/<your-fork>/Meta_Finals.git"`
-- **Cell 8:** `HF_PUSH_REPO = "<your-username>/ermap-doctor-lora"`
+- **Cell 6:** `GIT_URL = "https://github.com/VaibhavDeopa/Multi-Agents-for-Clinical-Decision-Making.git"` (or your own fork)
+- **Cell 8:** `HF_PUSH_REPO = "ankitraj86/ermap-doctor-lora"` (your HF username)
 
 If you uploaded the repo as a Kaggle Dataset instead, leave `GIT_URL` as the
 placeholder — cell 6 will detect `/kaggle/input/ermap-source` and copy from
@@ -770,7 +854,7 @@ there.
 | 3 | **REPAIR** — pin torch 2.10 cu128, reinstall bitsandbytes, upgrade unsloth | `REPAIR OK` (or `RESTART REQUIRED`) |
 | **(restart)** | If cell 3 said RESTART REQUIRED → Run → Restart kernel | — |
 | 5 | Post-restart import verify | All `OK`, GPUs listed |
-| 6 | Clone / mount the repo | `OK. Repo at /kaggle/working/Meta_Finals` |
+| 6 | Clone / mount the repo | `OK. Repo at /kaggle/working/Multi-Agents-for-Clinical-Decision-Making` |
 | 7 | Wire Kaggle Secrets → env vars | `OK — at least one Groq key is wired` |
 | 8 | HF Hub config | `Starting fresh — no resume.` |
 | 9 | Hyperparameters (P1=+1.2, P2=+1.1, P3=+1.0) | thresholds printed |
@@ -842,6 +926,8 @@ def build_notebook() -> dict:
         code_cell(CELL_16_PUSH_PLOTS),              # 17
         md_cell(CELL_17_INFER_MD),                  # 18
         code_cell(CELL_17_INFER),                   # 19
+        md_cell(CELL_18_COMPARE_MD),                # 20
+        code_cell(CELL_18_COMPARE),                 # 21
     ]
     return {
         "cells": cells,

@@ -517,6 +517,40 @@ def _response_logprob(
     return sum_logp, n_tokens
 
 
+def _ref_logprob_with_disabled_adapter(
+    model,
+    tokenizer,
+    prompt: str,
+    response: str,
+    device: str,
+    max_seq_length: int = 1024,
+) -> Tuple[torch.Tensor, int]:
+    """
+    Compute reference (no-LoRA) log-prob by temporarily disabling the
+    PEFT adapter on `model`. This avoids loading a SECOND base model for
+    KL regularization — saves ~5.7 GB on T4 / consumer GPUs.
+
+    Falls back to a normal forward pass if the adapter cannot be disabled
+    (which means the model is already the base model — KL term will be 0
+    and the backward pass will still be correct).
+    """
+    try:
+        ctx = model.disable_adapter()
+    except (AttributeError, ValueError):
+        ctx = None
+
+    if ctx is None:
+        with torch.no_grad():
+            return _response_logprob(
+                model, tokenizer, prompt, response, device, max_seq_length
+            )
+
+    with ctx, torch.no_grad():
+        return _response_logprob(
+            model, tokenizer, prompt, response, device, max_seq_length
+        )
+
+
 def manual_grpo_step(
     model,
     ref_model,
@@ -525,6 +559,7 @@ def manual_grpo_step(
     optimizer,
     beta: float = 0.04,
     device: str = "cuda",
+    max_seq_length: int = 1024,
 ) -> Dict[str, float]:
     """
     Apply one GRPO update over a group of G trajectories that share the
@@ -535,9 +570,16 @@ def manual_grpo_step(
         L    = - mean_i ( A_i * mean_t logp_pi(a_t|s_t) )
                + beta * mean_t ( logp_pi - logp_ref ) ** 2
 
-    The KL term is computed implicitly as a squared log-ratio (a stable
-    surrogate for low-magnitude policy drift). Token-level masking
-    ensures we only learn from response tokens, not prompt tokens.
+    Memory strategy (T4 / consumer-GPU friendly):
+      * Reference log-probs come from `model.disable_adapter()` rather
+        than a separately loaded base model, when ref_model is None.
+      * Per-step backward + grad accumulation: each (prompt, response)
+        contributes its loss, runs backward immediately, and the
+        autograd graph is freed before processing the next step.
+        gradients accumulate on `.grad`, and a single optimizer.step()
+        fires at the end.
+      * `torch.cuda.empty_cache()` between steps keeps fragmentation
+        in check on the 15.6 GB T4.
     """
     if not trajectories:
         return {"loss": 0.0, "kl": 0.0, "n_steps": 0}
@@ -547,7 +589,6 @@ def manual_grpo_step(
         device=device, dtype=torch.float32,
     )
     if rewards.numel() < 2 or rewards.std().item() < 1e-6:
-        # All trajectories same reward -> no signal; skip the update.
         return {
             "loss": 0.0, "kl": 0.0, "n_steps": 0,
             "advantages_mean": 0.0, "advantages_std": 0.0,
@@ -556,43 +597,58 @@ def manual_grpo_step(
 
     advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
 
-    total_loss = torch.zeros((), device=device)
+    optimizer.zero_grad(set_to_none=True)
+
+    total_loss_val = 0.0
     total_kl = 0.0
     n_steps = 0
 
+    pre_count = 0
+    for t in trajectories:
+        pre_count += sum(1 for _ in zip(t["prompts"], t["responses"]))
+    if pre_count == 0:
+        return {"loss": 0.0, "kl": 0.0, "n_steps": 0}
+
     for traj_idx, traj in enumerate(trajectories):
-        adv = advantages[traj_idx]
+        adv = advantages[traj_idx].detach()
         for prompt, response in zip(traj["prompts"], traj["responses"]):
             logp_pi, n_tok = _response_logprob(
-                model, tokenizer, prompt, response, device
+                model, tokenizer, prompt, response, device, max_seq_length
             )
             if n_tok == 0:
+                del logp_pi
                 continue
 
-            with torch.no_grad():
-                logp_ref, _ = _response_logprob(
-                    ref_model, tokenizer, prompt, response, device
+            if ref_model is None:
+                logp_ref, _ = _ref_logprob_with_disabled_adapter(
+                    model, tokenizer, prompt, response, device, max_seq_length
                 )
+            else:
+                with torch.no_grad():
+                    logp_ref, _ = _response_logprob(
+                        ref_model, tokenizer, prompt, response, device, max_seq_length
+                    )
 
-            # Length-normalize so long responses don't dominate.
             logp_pi_norm = logp_pi / max(n_tok, 1)
-            logp_ref_norm = logp_ref / max(n_tok, 1)
+            logp_ref_norm = (logp_ref / max(n_tok, 1)).detach()
 
             policy_term = -(adv * logp_pi_norm)
             kl_term = (logp_pi_norm - logp_ref_norm).pow(2)
-            step_loss = policy_term + beta * kl_term
+            step_loss = (policy_term + beta * kl_term) / pre_count
 
-            total_loss = total_loss + step_loss
+            step_loss.backward()
+
+            total_loss_val += float(step_loss.detach().item()) * pre_count
             total_kl += float((logp_pi_norm - logp_ref_norm).abs().detach().item())
             n_steps += 1
+
+            del logp_pi, logp_pi_norm, policy_term, kl_term, step_loss, logp_ref, logp_ref_norm
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     if n_steps == 0:
         return {"loss": 0.0, "kl": 0.0, "n_steps": 0}
 
-    total_loss = total_loss / n_steps
-
-    optimizer.zero_grad()
-    total_loss.backward()
     torch.nn.utils.clip_grad_norm_(
         [p for p in model.parameters() if p.requires_grad],
         max_norm=1.0,
@@ -600,7 +656,7 @@ def manual_grpo_step(
     optimizer.step()
 
     return {
-        "loss": float(total_loss.item()),
+        "loss": total_loss_val / n_steps,
         "kl": total_kl / n_steps,
         "n_steps": n_steps,
         "advantages_mean": float(advantages.mean().item()),
@@ -749,11 +805,15 @@ def train(
     logger.info(f"  {scheduler.current_phase.description}")
 
     # --- Model / reference / optimizer ---
+    # NOTE: We deliberately do NOT load a separate ref_model. On 15.6 GB T4s
+    # the second 8B base would push us into OOM. Instead, manual_grpo_step
+    # uses model.disable_adapter() to get reference log-probs from the same
+    # PEFT-wrapped model, saving ~5.7 GB.
     if not dry_run:
         model, tokenizer = load_model_and_tokenizer(model_name=model_name)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
-        ref_model = load_reference_model(model_name)
+        ref_model = None
         trainable = [p for p in model.parameters() if p.requires_grad]
         optimizer = torch.optim.AdamW(trainable, lr=learning_rate)
     else:

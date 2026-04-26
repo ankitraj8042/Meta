@@ -355,16 +355,30 @@ def main() -> int:
             print(f"    {icon} {rec['outcome']:9s} | reward {rec['total_reward']:+.2f} | "
                   f"steps {rec['steps']}", flush=True)
 
-        # AUTO-SAVE the clean episode-vs-reward histogram for this phase
-        # immediately after the phase finishes — we never lose data even
-        # if a later phase crashes.
-        png_path = save_phase_plot(results_by_phase[phase], phase, str(out_dir))
-        print_phase_summary(phase, results_by_phase[phase])
-        print(f"\n  >>> Saved: {png_path}", flush=True)
+        # Always save the raw JSON FIRST so a plot-backend crash (e.g. on
+        # locked-down Windows boxes where matplotlib's AGG renderer is
+        # blocked) doesn't lose us the actual evaluation data. Plots are
+        # nice-to-have; the JSON is the source of truth.
+        results_path = out_dir / "baseline_results.json"
+        try:
+            with results_path.open("w", encoding="utf-8") as f:
+                json.dump(all_results, f, indent=2)
+        except Exception as e:
+            print(f"  WARN: failed to save partial JSON: {e}", flush=True)
+
+        try:
+            png_path = save_phase_plot(results_by_phase[phase], phase, str(out_dir))
+            print_phase_summary(phase, results_by_phase[phase])
+            print(f"\n  >>> Saved: {png_path}", flush=True)
+        except Exception as e:
+            print(f"  WARN: phase {phase} plot failed (data still saved to JSON): "
+                  f"{type(e).__name__}: {str(e)[:140]}", flush=True)
+            print_phase_summary(phase, results_by_phase[phase])
 
     env.close()
 
-    # Save the full raw JSON record for re-plotting / cross-checks later
+    # Final JSON write (idempotent — already written after each phase, but
+    # we re-emit the absolute path so users see exactly where to look).
     results_path = out_dir / "baseline_results.json"
     with results_path.open("w", encoding="utf-8") as f:
         json.dump(all_results, f, indent=2)
@@ -372,8 +386,12 @@ def main() -> int:
 
     # Cross-phase comparison only makes sense if we ran ≥2 phases
     if len(results_by_phase) >= 2:
-        cmp_path = save_comparison_plot(dict(results_by_phase), str(out_dir))
-        print(f"  Comparison: {cmp_path}", flush=True)
+        try:
+            cmp_path = save_comparison_plot(dict(results_by_phase), str(out_dir))
+            print(f"  Comparison: {cmp_path}", flush=True)
+        except Exception as e:
+            print(f"  WARN: comparison plot failed (data still in JSON): "
+                  f"{type(e).__name__}: {str(e)[:140]}", flush=True)
 
     print("\n  Baseline evaluation complete.\n", flush=True)
     return 0
